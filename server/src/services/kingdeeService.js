@@ -195,6 +195,35 @@ class KingdeeClient {
   }
 
   /**
+   * 保存/创建业务对象（单据）
+   * 调用 DynamicFormService.Save，用于新建或修改金蝶单据
+   * @param {string} formId - 业务对象 FormId，如 PRD_INSTOCK
+   * @param {object} model - 单据数据模型
+   * @param {object} [options] - 额外选项
+   * @param {boolean} [options.createOnly=false] - true=只允许新建(不覆盖已有)
+   * @returns {Promise<{data, cookies}>}
+   */
+  async save(formId, model, options = {}) {
+    // Kingdee Save API:
+    //   外层: { FormId, data: JSON.stringify({ Model, ... }) }
+    //   FormId 在外层，JSON 字符串内放 Model
+    const inner = { Model: model };
+    if (options.createOnly) inner.CreateOnly = true;
+    if (options.ignoreRule) inner.IgnoreRule = true;
+    if (options.ignoreInteraction) inner.IgnoreInteraction = true;
+    const payload = {
+      FormId: formId,
+      data: JSON.stringify(inner),
+    };
+    return this.callWithAuth(() =>
+      this._request(
+        'Kingdee.BOS.WebApi.ServicesStub.DynamicFormService.Save.common.kdsvc',
+        payload,
+      ),
+    );
+  }
+
+  /**
    * 通用 HTTP 请求
    */
   _request(path, data) {

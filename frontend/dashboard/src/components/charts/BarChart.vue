@@ -39,7 +39,7 @@ function renderChart() {
         return `${p.name}<br/>${p.marker} ${val}`
       },
     },
-    grid: { left: 48, right: 16, top: props.title ? 44 : 20, bottom: 28 },
+    grid: { left: 56, right: 16, top: props.title ? 44 : 20, bottom: 28 },
     xAxis: {
       type: 'category',
       data: props.data.map((d) => d.label),
@@ -50,7 +50,15 @@ function renderChart() {
     yAxis: {
       type: 'value',
       splitLine: { lineStyle: { color: '#F1F5F9', type: 'dashed' } },
-      axisLabel: { color: '#94A3B8', fontSize: 11 },
+      axisLabel: {
+        color: '#94A3B8',
+        fontSize: 11,
+        formatter: (val) => {
+          if (val >= 10000) return (val / 10000).toFixed(1) + '万'
+          if (val >= 1000) return (val / 1000).toFixed(1) + 'k'
+          return val.toLocaleString()
+        },
+      },
     },
     series: [
       {
@@ -65,6 +73,19 @@ function renderChart() {
           return d.value;
         }),
         barWidth: '50%',
+        label: {
+          show: props.data.length <= 15,
+          position: 'top',
+          color: '#475569',
+          fontSize: 11,
+          fontWeight: 600,
+          formatter: (params) => {
+            const v = params.value
+            const num = typeof v === 'object' ? v.value : v
+            if (num >= 10000) return (num / 10000).toFixed(1) + '万'
+            return num.toLocaleString()
+          },
+        },
         itemStyle: props.colors ? undefined : {
           color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
             { offset: 0, color: props.barColor },

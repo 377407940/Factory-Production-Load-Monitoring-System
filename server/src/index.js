@@ -15,8 +15,8 @@ const cors = require('cors');
 const path = require('path');
 const config = require('./config');
 const monitorRouter = require('./routes/monitor');
-const authRouter = require('./routes/auth');
-const { authMiddleware } = require('./middleware/auth');
+const PowerSyncService = require('./services/powerSyncService');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = config.server.port;
@@ -31,15 +31,76 @@ app.use((req, res, next) => {
   next();
 });
 
-// ==== 路由 ====
-// 认证路由（不需要登录）
-app.use('/api/auth', authRouter);
+// ==== 钉钉 UA / 文档内嵌 检查中间件 ====
+function dingtalkOnly(req, res, next) {
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  const referer = (req.headers['referer'] || '').toLowerCase();
 
-// 监控路由（需要 JWT 验证）
-app.use('/api/monitor', authMiddleware, monitorRouter);
+  // 钉钉客户端内置浏览器 → 放行
+  if (ua.includes('dingtalk') || ua.includes('dingding')) return next();
+  // 钉钉文档内嵌浏览器（通过 Referer 判断）→ 放行
+  if (referer.includes('alidocs.dingtalk.com') || referer.includes('dingtalk.com/docs')) return next();
+  // SPA 自身发出的 API 请求（同源）→ 放行（确保钉钉文档内嵌时 API 正常工作）
+  if (referer.includes(req.hostname)) return next();
+
+  // 非钉钉请求：返回阻止页面
+  res.status(403).send(`<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>访问受限</title><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f0f2f5;font-family:-apple-system,BlinkMacSystemFont,sans-serif;text-align:center;padding:20px}.box{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:48px 32px;max-width:360px;box-shadow:0 4px 20px rgba(0,0,0,.06)}.icon{width:64px;height:64px;margin:0 auto 20px;background:#eff6ff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:32px}.title{font-size:18px;font-weight:700;color:#111827;margin-bottom:8px}.desc{font-size:14px;color:#6b7280;line-height:1.6}</style></head>
+<body><div class="box"><div class="icon">📱</div><div class="title">请在钉钉中打开</div><div class="desc">此页面仅在钉钉应用内允许访问，请使用钉钉扫描二维码或通过钉钉工作台打开。</div></div></body></html>`);
+}
+
+// ==== 路由 ====
+// 监控路由（钉钉 UA 保护）
+app.use('/api/monitor', dingtalkOnly, monitorRouter);
 
 // 初始化聚合引擎并预热缓存
 const engine = monitorRouter.initEngine();
+
+// 初始化电表数据同步服务
+const powerService = new PowerSyncService();
+const powerInitialized = powerService.initialize();
+if (powerInitialized) {
+  // 注册到 monitor router
+  monitorRouter.setPowerService(powerService);
+  // 注入聚合引擎（用于车间负载率基于电量的计算）
+  engine.setPowerService(powerService);
+
+  // 电表同步完成后清除响应缓存
+  powerService.onSync(() => monitorRouter.clearCache());
+
+  // 金蝶同步完成后同样清除响应缓存
+  engine.onSync(() => monitorRouter.clearCache());
+
+  // 如果电表 API 已配置且有数据需要同步
+  if (powerService.isMeterConfigured()) {
+    // 启动时尝试同步（不阻塞）
+    if (!powerService.store.hasData()) {
+      powerService.sync().then(() => {
+        console.log('[server] 电表数据首次同步完成');
+      }).catch(err => {
+        console.warn(`[server] 电表数据首次同步失败: ${err.message}`);
+      });
+    } else {
+      console.log('[server] 电表数据已存在，跳过首次同步');
+    }
+    // 注册每日 8:00 定时同步
+    powerService.scheduleDaily();
+  } else {
+    console.log('[server] 电表 API 未配置，跳过同步');
+  }
+} else {
+  console.log('[server] 电表服务未初始化（降级运行）');
+}
+
+// 金蝶生产数据定时同步（每半小时触发，避免与电表整点同步冲突）
+if (engine.db) {
+  cron.schedule('30 * * * *', () => {
+    console.log('[server] 金蝶生产数据定时同步触发');
+    engine.scheduleSync();
+  });
+  console.log('[server] 已注册金蝶定时同步：每小时 30 分');
+}
 
 // 异步预热（不阻塞 listen）
 (async () => {
@@ -125,6 +186,23 @@ app.get('/', (req, res) => {
   });
 });
 
+// ==== 前端静态文件（钉钉 UA 保护） ====
+const frontendDist = path.resolve(__dirname, '../../frontend/dashboard/dist');
+// index.html 不缓存（确保部署后浏览器获取最新版本），带 hash 的静态资源长期缓存
+app.use('/monitor', dingtalkOnly, express.static(frontendDist, {
+  maxAge: '1y',
+  setHeaders(res, filePath) {
+    if (filePath.endsWith('index.html')) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    }
+  },
+}));
+// SPA 回退：/monitor/* 不匹配文件时返回 index.html
+app.get('/monitor/*', dingtalkOnly, (req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.sendFile(path.join(frontendDist, 'index.html'));
+});
+
 // ==== 404 ====
 app.use((req, res) => {
   res.status(404).json({ code: 404, msg: 'Not Found' });
@@ -149,6 +227,9 @@ process.on('SIGINT', () => {
   if (engine && engine.db) {
     engine.db.close();
   }
+  if (powerService && powerService.store) {
+    powerService.store.close();
+  }
   process.exit(0);
 });
 
@@ -156,6 +237,9 @@ process.on('SIGTERM', () => {
   console.log('[server] 收到 SIGTERM，正在关闭...');
   if (engine && engine.db) {
     engine.db.close();
+  }
+  if (powerService && powerService.store) {
+    powerService.store.close();
   }
   process.exit(0);
 });

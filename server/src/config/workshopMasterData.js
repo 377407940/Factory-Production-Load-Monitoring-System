@@ -5,10 +5,9 @@
  * 设备类型（机型）用于筛选和设备分类。
  */
 
-/** 9 个车间 */
+/** 8 个车间（Y固体一2号车间已合并到1号车间） */
 const WORKSHOPS = [
   'Y固体一1号车间',
-  'Y固体一2号车间',
   'Y固体一3号车间',
   'Y固体一5号车间',
   'Y固体一6号车间',
@@ -20,8 +19,7 @@ const WORKSHOPS = [
 
 /** 车间面积（㎡） */
 const WORKSHOP_AREAS = {
-  'Y固体一1号车间': 245,
-  'Y固体一2号车间': 55,
+  'Y固体一1号车间': 300, // 245（原1号）+ 55（原2号，已合并）
   'Y固体一3号车间': 110,
   'Y固体一5号车间': 186,
   'Y固体一6号车间': 154,
@@ -48,12 +46,13 @@ const EQUIPMENT_LIST = [
   { name: '粉体12列机P机台',   type: '粉体', defaultWorkshop: 'Y固体二车间',     lanes: 12, designSpeed: 60 },
   { name: '粉体24.3十列机',    type: '粉体', defaultWorkshop: 'Y固体二车间',     lanes: 10, designSpeed: 40 },
   { name: '粉体45.1八列机',    type: '粉体', defaultWorkshop: '',                lanes: 8,  designSpeed: 35 },
-  { name: '粉体A机台',         type: '粉体', defaultWorkshop: 'Y固体一2号车间',  lanes: 1,  designSpeed: 40 },
-  { name: '粉体B机台',         type: '粉体', defaultWorkshop: 'Y固体一2号车间',  lanes: 1,  designSpeed: 40 },
+  { name: '粉体A机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
+  { name: '粉体B机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
   { name: '粉体C机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
   { name: '粉体D机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
   { name: '粉体E机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
   { name: '粉体F机台',         type: '粉体', defaultWorkshop: 'Y固体一分包间',   lanes: 1,  designSpeed: 40 },
+  { name: '粉体G机台',         type: '粉体', defaultWorkshop: 'Y固体一分包间',   lanes: 1,  designSpeed: 40 },
   { name: '粉体M机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
   { name: '30.6粉体十列机',    type: '粉体', defaultWorkshop: '',                lanes: 10, designSpeed: 40 },
   { name: '软袋包装机',        type: '粉体', defaultWorkshop: 'Y固体一8号车间',  lanes: 1,  designSpeed: 12 },
@@ -94,11 +93,29 @@ function getDefaultEquipmentByWorkshop(workshop) {
     .map((e) => e.name);
 }
 
+/**
+ * 车间负载率阈值配置（基于日用电量 kWh）
+ *   < low  → 0%
+ *   low ~ high → 50%
+ *   > high → 100%
+ */
+const WORKSHOP_LOAD_RATE_THRESHOLDS = {
+  'Y固体一1号车间': { low: 20, high: 400 },
+  'Y固体一3号车间': { low: 20, high: 120 },
+  'Y固体一5号车间': { low: 20, high: 400 },
+  'Y固体一6号车间': { low: 20, high: 200 },
+  'Y固体一8号车间': { low: 100, high: 900 },
+  'Y固体一分包间':  { low: 100, high: 200 },
+  'Y固体二车间':    { low: 100, high: 1000 },
+  'Y液体二车间':    { low: 100, high: 500 },
+};
+
 module.exports = {
   WORKSHOPS,
   WORKSHOP_AREAS,
   EQUIPMENT_TYPES,
   EQUIPMENT_LIST,
+  WORKSHOP_LOAD_RATE_THRESHOLDS,
   getEquipmentByName,
   getEquipmentNamesByType,
   getDefaultEquipmentByWorkshop,

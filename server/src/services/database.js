@@ -133,6 +133,36 @@ class Database {
   }
 
   /**
+   * 读取指定日期范围内的记录
+   * @param {string} startDate - 'YYYY-MM-DD'
+   * @param {string} endDate - 'YYYY-MM-DD'
+   * @returns {Array<{ date: string, shift: string, workshop: string, machine: string, fields: object }>}
+   */
+  getRecordsInRange(startDate, endDate) {
+    if (!this.db) return [];
+
+    try {
+      const rows = this.db.prepare(
+        'SELECT * FROM records WHERE fdate >= ? AND fdate <= ? ORDER BY fdate ASC'
+      ).all(startDate, endDate);
+      return rows.map((r) => {
+        const fields = JSON.parse(r.fields_json);
+        return {
+          date: r.fdate,
+          shift: r.shift,
+          workshop: r.workshop,
+          machine: r.machine,
+          fields,
+          content_hash: r.content_hash,
+        };
+      });
+    } catch (err) {
+      console.error(`[db] 读取记录失败: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
    * 全量替换所有记录（用于首次同步或全量覆盖）
    * @param {Array} records - 处理后的记录数组
    */

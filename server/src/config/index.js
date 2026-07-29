@@ -1,6 +1,8 @@
 /**
  * 工厂负载监控系统 - 配置
  */
+const path = require('path');
+
 module.exports = {
   // 金蝶云星空 API 配置（通过环境变量注入）
   kingdee: {
@@ -34,7 +36,17 @@ module.exports = {
 
   // 同步配置（秒）
   sync: {
-    interval: parseInt(process.env.SYNC_INTERVAL || '300', 10), // 增量同步间隔，默认 5 分钟
+    interval: parseInt(process.env.SYNC_INTERVAL || '3600', 10), // 增量同步间隔，默认 1 小时
     fullResyncHours: parseInt(process.env.FULL_RESYNC_HOURS || '168', 10), // 全量覆盖周期，默认 7 天
+  },
+
+  // 智能电表配置
+  meter: {
+    enabled: process.env.METER_ENABLED !== 'false',
+    baseUrl: process.env.METER_BASE_URL || '',
+    account: process.env.METER_ACCOUNT || '',
+    password: process.env.METER_PASSWORD || '',
+    dbPath: process.env.METER_DB_PATH || path.resolve(__dirname, '../../data/power_data.db'),
+    pricePerKwh: parseFloat(process.env.METER_PRICE_PER_KWH || '0.92'),
   },
 };

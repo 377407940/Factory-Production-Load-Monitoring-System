@@ -9,6 +9,8 @@ const props = defineProps({
   outputUnit: { type: String, default: '条' },
   loadRate: { type: Number, default: 0 },
   status: { type: String, default: 'health' },
+  power: { type: Number, default: null },
+  powerCost: { type: Number, default: null },
 })
 
 const emit = defineEmits(['click'])
@@ -65,11 +67,17 @@ const outputRateColor = computed(() => {
           <span class="metric-unit">{{ outputUnit }}</span>
         </div>
         <div class="metric-item">
-          <span class="metric-label">负荷率</span>
+          <span class="metric-label">车间负载率</span>
           <span class="metric-value">{{ loadRate }}%</span>
           <div class="progress-track">
             <div class="progress-fill" :style="{ width: loadRateBarWidth + '%', background: '#3B82F6' }"></div>
           </div>
+        </div>
+        <div v-if="power !== null" class="metric-item">
+          <span class="metric-label">用电量</span>
+          <span class="metric-value metric-power">{{ power >= 10000 ? (power / 10000).toFixed(1) + '万' : power.toFixed(1) }}</span>
+          <span class="metric-unit">kWh</span>
+          <span v-if="powerCost !== null" class="metric-cost">{{ powerCost.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) }} 元</span>
         </div>
       </div>
     </div>
@@ -190,5 +198,35 @@ const outputRateColor = computed(() => {
   height: 100%;
   border-radius: 2px;
   transition: width 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.metric-cost {
+  font-size: 12px;
+  font-weight: 600;
+  color: #f97316;
+  margin-top: 1px;
+}
+
+@media (max-width: 768px) {
+  .workshop-body {
+    padding: 12px 14px;
+    gap: 10px;
+  }
+  .workshop-name {
+    font-size: 13px;
+  }
+  .workshop-metrics {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .metric-item {
+    min-width: calc(50% - 4px);
+  }
+  .metric-value {
+    font-size: 15px;
+  }
+  .progress-track {
+    width: 90%;
+  }
 }
 </style>

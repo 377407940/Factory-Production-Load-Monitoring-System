@@ -6,6 +6,7 @@ import MetricCard from '../components/widgets/MetricCard.vue'
 import EquipmentTable from '../components/widgets/EquipmentTable.vue'
 import TrendLine from '../components/charts/TrendLine.vue'
 import BarChart from '../components/charts/BarChart.vue'
+import PeriodSelector from '../components/widgets/PeriodSelector.vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -22,13 +23,25 @@ const currentYear = ref(parseInt(route.query.year) || new Date().getFullYear())
 const availableYears = [2025, 2026]
 const loading = ref(true)
 const detailData = ref(null)
+const periodSelectorRef = ref(null)
+
+const currentPeriod = ref(
+  (route.query.startDate && route.query.endDate)
+    ? { startDate: route.query.startDate, endDate: route.query.endDate }
+    : null
+)
+
+const powerTrend = computed(() => {
+  return detailData.value?.powerTrend || []
+})
 
 const workshopName = computed(() => route.params.name)
 
 async function loadData() {
   loading.value = true
   try {
-    detailData.value = await fetchWorkshopDetail(workshopName.value, currentDimension.value, currentYear.value)
+    const { startDate, endDate } = currentPeriod.value || {}
+    detailData.value = await fetchWorkshopDetail(workshopName.value, currentDimension.value, currentYear.value, startDate, endDate)
   } catch (e) {
     console.error('[workshop] 加载失败:', e)
   }
@@ -37,26 +50,52 @@ async function loadData() {
 
 function onDimensionChange(dim) {
   currentDimension.value = dim
+  currentPeriod.value = null
   router.replace({ query: { ...route.query, dimension: dim } })
 }
 
 function onYearChange(year) {
   currentYear.value = year
+  currentPeriod.value = null
   router.replace({ query: { ...route.query, year } })
 }
 
+function onPeriodChange(period) {
+  currentPeriod.value = period
+  const query = { ...route.query }
+  if (period) {
+    query.startDate = period.startDate
+    query.endDate = period.endDate
+  } else {
+    delete query.startDate
+    delete query.endDate
+  }
+  router.replace({ query })
+}
+
 function onEquipmentSelect(equipment) {
+  const query = { dimension: currentDimension.value, year: currentYear.value }
+  if (currentPeriod.value) {
+    query.startDate = currentPeriod.value.startDate
+    query.endDate = currentPeriod.value.endDate
+  }
   router.push({
     name: 'EquipmentDetail',
     params: { name: equipment.name },
-    query: { workshop: workshopName.value, dimension: currentDimension.value, year: currentYear.value },
+    query: { ...query, workshop: workshopName.value },
   })
 }
 
-onMounted(loadData)
+onMounted(() => {
+  loadData()
+  if (currentPeriod.value && periodSelectorRef.value) {
+    periodSelectorRef.value.setFromUrl(currentPeriod.value.startDate, currentPeriod.value.endDate)
+  }
+})
 
 watch(currentDimension, loadData)
 watch(currentYear, loadData)
+watch(currentPeriod, loadData)
 watch(
   () => route.params.name,
   () => {
@@ -74,6 +113,12 @@ watch(
         <select class="year-select" :value="currentYear" @change="onYearChange(Number($event.target.value))">
           <option v-for="y in availableYears" :key="y" :value="y">{{ y }} 年</option>
         </select>
+        <PeriodSelector
+          ref="periodSelectorRef"
+          :dimension="currentDimension"
+          :year="currentYear"
+          @update:period="onPeriodChange"
+        />
         <div class="dimension-switcher">
           <button
             v-for="dim in dimensions"
@@ -108,7 +153,7 @@ watch(
         :color="(detailData?.outputRate ?? 0) >= 85 ? '#52c41a' : (detailData?.outputRate ?? 0) >= 70 ? '#faad14' : '#ff4d4f'"
       />
       <MetricCard
-        title="负荷率"
+        title="车间负载率"
         :value="detailData?.loadRate ?? '--'"
         unit="%"
         color="#faad14"
@@ -128,9 +173,21 @@ watch(
       <div class="chart-col">
         <TrendLine
           :data="detailData?.loadRateTrend || []"
-          title="负荷率趋势"
+          title="车间负载率趋势"
           :height="300"
           line-color="#faad14"
+        />
+      </div>
+    </div>
+
+    <!-- 用电量趋势图 -->
+    <div v-if="powerTrend.length > 0" class="chart-row">
+      <div class="chart-col chart-full">
+        <TrendLine
+          :data="powerTrend"
+          title="用电量趋势"
+          :height="300"
+          line-color="#1890ff"
         />
       </div>
     </div>
@@ -250,6 +307,27 @@ watch(
 }
 
 @media (max-width: 768px) {
+  .detail-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .header-controls {
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+  }
+  .page-title {
+    font-size: 16px;
+  }
+  .dim-btn {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+  .year-select {
+    font-size: 12px;
+    padding: 4px 6px;
+  }
   .metric-grid { grid-template-columns: 1fr; }
 }
 </style>

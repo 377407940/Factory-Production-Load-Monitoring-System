@@ -6,6 +6,8 @@ const props = defineProps({
   value: { type: [String, Number], default: '' },
   unit: { type: String, default: '' },
   color: { type: String, default: '#1890ff' },
+  subText: { type: String, default: '' },
+  subLabel: { type: String, default: '' },
 })
 
 const displayValue = ref('')
@@ -58,6 +60,13 @@ watch(() => props.value, animateValue)
       {{ displayValue }}
       <span v-if="unit && displayValue !== '--'" class="metric-unit">{{ unit }}</span>
     </div>
+    <div v-if="subText" class="metric-sub">
+      <div class="sub-divider"></div>
+      <div class="sub-row">
+        <span v-if="subLabel" class="sub-label">{{ subLabel }}</span>
+        <span class="sub-value">{{ subText }}</span>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -106,5 +115,49 @@ watch(() => props.value, animateValue)
   font-weight: 400;
   margin-left: 3px;
   opacity: 0.75;
+}
+
+.metric-sub {
+  margin-top: 10px;
+}
+
+.sub-divider {
+  height: 1px;
+  background: var(--border-color, #E2E8F0);
+  margin-bottom: 8px;
+  opacity: 0.5;
+}
+
+.sub-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sub-label {
+  font-size: 12px;
+  color: var(--text-muted, #94A3B8);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.sub-value {
+  font-size: 15px;
+  color: var(--text-secondary, #475569);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 768px) {
+  .metric-card {
+    padding: 14px 16px;
+  }
+  .metric-value {
+    font-size: 22px;
+  }
+  .sub-value {
+    font-size: 13px;
+  }
 }
 </style>

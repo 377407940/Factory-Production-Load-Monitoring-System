@@ -5,6 +5,7 @@ import { fetchEquipmentDetail } from '../api/monitor.js'
 import MetricCard from '../components/widgets/MetricCard.vue'
 import TrendLine from '../components/charts/TrendLine.vue'
 import BarChart from '../components/charts/BarChart.vue'
+import PeriodSelector from '../components/widgets/PeriodSelector.vue'
 
 const chartColors = ['#1890ff', '#52c41a', '#faad14', '#ff4d4f', '#722ed1', '#13c2c2', '#eb2f96', '#fa8c16']
 
@@ -23,13 +24,21 @@ const currentYear = ref(parseInt(route.query.year) || new Date().getFullYear())
 const availableYears = [2025, 2026]
 const loading = ref(true)
 const detailData = ref(null)
+const periodSelectorRef = ref(null)
+
+const currentPeriod = ref(
+  (route.query.startDate && route.query.endDate)
+    ? { startDate: route.query.startDate, endDate: route.query.endDate }
+    : null
+)
 
 const equipmentName = computed(() => route.params.name)
 
 async function loadData() {
   loading.value = true
   try {
-    detailData.value = await fetchEquipmentDetail(equipmentName.value, currentDimension.value, currentYear.value)
+    const { startDate, endDate } = currentPeriod.value || {}
+    detailData.value = await fetchEquipmentDetail(equipmentName.value, currentDimension.value, currentYear.value, startDate, endDate)
   } catch (e) {
     console.error('[equipment] 加载失败:', e)
   }
@@ -38,12 +47,27 @@ async function loadData() {
 
 function onDimensionChange(dim) {
   currentDimension.value = dim
+  currentPeriod.value = null
   router.replace({ query: { ...route.query, dimension: dim } })
 }
 
 function onYearChange(year) {
   currentYear.value = year
+  currentPeriod.value = null
   router.replace({ query: { ...route.query, year } })
+}
+
+function onPeriodChange(period) {
+  currentPeriod.value = period
+  const query = { ...route.query }
+  if (period) {
+    query.startDate = period.startDate
+    query.endDate = period.endDate
+  } else {
+    delete query.startDate
+    delete query.endDate
+  }
+  router.replace({ query })
 }
 
 // 产量为0的车间不展示
@@ -71,10 +95,16 @@ const wsLoadRateTrendSeries = computed(() => {
   }))
 })
 
-onMounted(loadData)
+onMounted(() => {
+  loadData()
+  if (currentPeriod.value && periodSelectorRef.value) {
+    periodSelectorRef.value.setFromUrl(currentPeriod.value.startDate, currentPeriod.value.endDate)
+  }
+})
 
 watch(currentDimension, loadData)
 watch(currentYear, loadData)
+watch(currentPeriod, loadData)
 watch(
   () => route.params.name,
   () => {
@@ -92,6 +122,12 @@ watch(
         <select class="year-select" :value="currentYear" @change="onYearChange(Number($event.target.value))">
           <option v-for="y in availableYears" :key="y" :value="y">{{ y }} 年</option>
         </select>
+        <PeriodSelector
+          ref="periodSelectorRef"
+          :dimension="currentDimension"
+          :year="currentYear"
+          @update:period="onPeriodChange"
+        />
         <div class="dimension-switcher">
           <button
             v-for="dim in dimensions"
@@ -368,6 +404,31 @@ watch(
 }
 
 @media (max-width: 768px) {
+  .detail-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .header-controls {
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+  }
+  .page-title {
+    font-size: 16px;
+  }
+  .dim-btn {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+  .year-select {
+    font-size: 12px;
+    padding: 4px 6px;
+  }
   .metric-grid { grid-template-columns: 1fr; }
+  .ws-card-metrics {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
 }
 </style>

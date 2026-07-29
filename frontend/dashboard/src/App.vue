@@ -165,11 +165,39 @@ const breadcrumbItems = computed(() => {
 
 @media (max-width: 768px) {
   .app-header {
-    padding: 12px 16px;
-    gap: 16px;
+    padding: 10px 16px;
+    gap: 10px;
+    flex-wrap: wrap;
   }
   .app-main {
     padding: 16px;
+  }
+  .app-title {
+    font-size: 15px;
+  }
+  .breadcrumb {
+    font-size: 12px;
+    order: 10;
+    width: 100%;
+  }
+  .header-logo {
+    height: 28px;
+  }
+}
+
+@media (max-width: 480px) {
+  .app-header {
+    padding: 8px 12px;
+    gap: 6px;
+  }
+  .app-main {
+    padding: 12px;
+  }
+  .app-title {
+    font-size: 14px;
+  }
+  .header-logo {
+    height: 24px;
   }
 }
 </style>

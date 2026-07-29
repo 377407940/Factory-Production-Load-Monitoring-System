@@ -14,7 +14,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const config = require('../config');
 const { isWorkingDay, countWorkingDays, countWorkingDaysInMonth } = require('../config/holiday');
-const { WORKSHOPS, WORKSHOP_AREAS, EQUIPMENT_TYPES, EQUIPMENT_LIST, getEquipmentByName } = require('../config/workshopMasterData');
+const { WORKSHOPS, WORKSHOP_AREAS, EQUIPMENT_TYPES, EQUIPMENT_LIST, WORKSHOP_LOAD_RATE_THRESHOLDS, getEquipmentByName } = require('../config/workshopMasterData');
 
 /** 文件缓存目录（相对项目根目录） */
 const CACHE_DIR = path.resolve(__dirname, '../../data/cache');
@@ -71,6 +71,13 @@ const SHIFT_MAP = {
   '10': '白班',
   '20': '晚班',
 };
+
+// ====== PRD_MO（生产订单）常量 ======
+
+/** PRD_MO 查询字段 */
+const PRD_MO_FIELD_KEYS = ['FBillNo', 'FDate', 'FQty'];
+/** PRD_MO 内联解析字段（物料编码） */
+const PRD_MO_DOT_FIELD = 'FMaterialId.FNumber';
 
 // ====== 工具函数 ======
 
@@ -195,6 +202,12 @@ class AggregationEngine {
     this.SYNC_INTERVAL_MS = (config.sync.interval || 300) * 1000;
     this._syncTimer = null;
 
+    /** @type {Function|null} */
+    this._onSync = null;
+
+    /** @type {import('./powerSyncService')|null} */
+    this.powerService = null;
+
     // 启动时从文件缓存加载到内存
     this._loadAllFileCaches();
   }
@@ -206,29 +219,38 @@ class AggregationEngine {
    * - 有 SQLite：从本地读取，需要同步时后台触发
    * - 无 SQLite：回退金蝶直连
    * @param {string} dimension - 'day' | 'week' | 'month' | 'year'
+   * @param {number} [year]
+   * @param {string} [startDate] - 可选，日期范围起始 'YYYY-MM-DD'
+   * @param {string} [endDate] - 可选，日期范围结束 'YYYY-MM-DD'
    * @returns {Promise<object>}
    */
-  async fetchAndAggregate(dimension = 'day', year) {
-    const cacheKey = `${dimension}_${year || ''}`;
+  async fetchAndAggregate(dimension = 'day', year, startDate, endDate) {
+    const cacheKey = `${dimension}_${year || ''}_${startDate || ''}_${endDate || ''}`;
     const cached = this._cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
       console.log(`[agg] 缓存命中 key=${cacheKey}`);
       return cached.data;
     }
 
-    console.log(`[agg] 开始获取数据 dimension=${dimension} year=${year}`);
+    console.log(`[agg] 开始获取数据 dimension=${dimension} year=${year} startDate=${startDate || '-'} endDate=${endDate || '-'}`);
 
     let records;
 
     if (this.db) {
       // 有 SQLite：从本地读取
-      records = this._readFromStorage();
-      if (records.length === 0) {
-        // SQLite 为空，执行一次全量同步
-        records = await this._syncFromKingdee();
+      if (startDate && endDate) {
+        // 指定日期范围：按范围查询
+        records = this.db.getRecordsInRange(startDate, endDate);
+        console.log(`[agg] 按日期范围查询: ${startDate} ~ ${endDate}, ${records.length} 条`);
       } else {
-        // 检查是否需要后台同步（不阻塞本次请求）
-        this._checkSyncDue();
+        records = this._readFromStorage();
+        if (records.length === 0) {
+          // SQLite 为空，执行一次全量同步
+          records = await this._syncFromKingdee();
+        } else {
+          // 检查是否需要后台同步（不阻塞本次请求）
+          this._checkSyncDue();
+        }
       }
     } else {
       // 无 SQLite：金蝶直连（旧流程）
@@ -236,12 +258,33 @@ class AggregationEngine {
       await this._resolveWorkshopNames(records);
     }
 
+    // 合并 Y固体一2号车间 → Y固体一1号车间（在聚合前重映射）
+    this._remapWorkshopNames(records);
+
+    // 获取电表数据用于车间负载率计算
+    let powerDataMap = null;
+    if (this.powerService && this.powerService.isAvailable()) {
+      try {
+        const psYear = year || new Date().getFullYear();
+        const today = new Date().toISOString().slice(0, 10);
+        const psEnd = endDate || (psYear < new Date().getFullYear() ? `${psYear}-12-31` : today);
+        const psStart = startDate || `${psYear}-01-01`;
+        powerDataMap = this.powerService.getDailyWorkshopPowerMap(psStart, psEnd);
+        console.log(`[agg] 获取电表数据: ${powerDataMap.size} 个车间`);
+      } catch (err) {
+        console.warn(`[agg] 获取电表数据失败: ${err.message}`);
+      }
+    }
+
     // 聚合计算
-    const aggregated = this._aggregate(records, dimension, year);
+    const aggregated = this._aggregate(records, dimension, year, startDate, endDate, powerDataMap);
 
     // 缓存
     this._cache.set(cacheKey, { data: aggregated, timestamp: Date.now() });
-    this._saveToFileCache(dimension, year, aggregated);
+    // 只有全量数据才写入文件缓存
+    if (!startDate && !endDate) {
+      this._saveToFileCache(dimension, year, aggregated);
+    }
     console.log(`[agg] 聚合完成 dimension=${dimension} year=${year} records=${records.length}`);
 
     return aggregated;
@@ -250,31 +293,31 @@ class AggregationEngine {
   /**
    * 获取工厂总览
    */
-  async getOverview(dimension = 'day', year) {
-    return this._extractOverview(await this.fetchAndAggregate(dimension, year));
+  async getOverview(dimension = 'day', year, startDate, endDate) {
+    return this._extractOverview(await this.fetchAndAggregate(dimension, year, startDate, endDate));
   }
 
   /**
    * 获取所有车间聚合数据
    */
-  async getWorkshops(dimension = 'day', year) {
-    return this._extractWorkshops(await this.fetchAndAggregate(dimension, year));
+  async getWorkshops(dimension = 'day', year, startDate, endDate) {
+    return this._extractWorkshops(await this.fetchAndAggregate(dimension, year, startDate, endDate));
   }
 
   /**
    * 获取指定车间详情
    * @param {string} workshopName
    */
-  async getWorkshopDetail(workshopName, dimension = 'day', year) {
-    return this._extractWorkshopDetail(await this.fetchAndAggregate(dimension, year), workshopName);
+  async getWorkshopDetail(workshopName, dimension = 'day', year, startDate, endDate) {
+    return this._extractWorkshopDetail(await this.fetchAndAggregate(dimension, year, startDate, endDate), workshopName);
   }
 
   /**
    * 获取指定设备详情
    * @param {string} equipmentName
    */
-  async getEquipmentDetail(equipmentName, dimension = 'day', year) {
-    return this._extractEquipmentDetail(await this.fetchAndAggregate(dimension, year), equipmentName);
+  async getEquipmentDetail(equipmentName, dimension = 'day', year, startDate, endDate) {
+    return this._extractEquipmentDetail(await this.fetchAndAggregate(dimension, year, startDate, endDate), equipmentName);
   }
 
   /**
@@ -285,6 +328,75 @@ class AggregationEngine {
       type,
       equipment: EQUIPMENT_LIST.filter((e) => e.type === type).map((e) => e.name),
     }));
+  }
+
+  // ===================== PRD_MO 生产订单计划汇总 =====================
+
+  /**
+   * 将计划订单总量合并到总览数据中（仅年维度）
+   * 从金蝶 PRD_MO 获取物料含 MP 的订单计划总数量，减去已产出量得到剩余未完成
+   */
+  async mergePlannedOrderInfo(data, year) {
+    if (!year) return;
+    try {
+      const plannedTotal = await this._getPlannedOrderTotal(year);
+      data.plannedOrderTotal = plannedTotal;
+      data.remainingOrders = Math.max(0, plannedTotal - (data.totalOutput || 0));
+      console.log(`[agg] 计划订单: year=${year} plannedTotal=${plannedTotal} totalOutput=${data.totalOutput || 0} remaining=${data.remainingOrders}`);
+    } catch (err) {
+      console.warn(`[agg] 获取计划订单数据失败: ${err.message}`);
+    }
+  }
+
+  /**
+   * 查询金蝶 PRD_MO，汇总 2026 年物料编码含 MP 的订单计划数量
+   * 结果缓存到内存（和聚合缓存共用 TTL）
+   */
+  async _getPlannedOrderTotal(year) {
+    const cacheKey = `plannedTotal_${year}`;
+    const cached = this._cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.data;
+    }
+
+    console.log(`[agg] 查询 PRD_MO (year=${year})`);
+
+    const extendedKeys = [...PRD_MO_FIELD_KEYS, PRD_MO_DOT_FIELD];
+    const rawResult = await this.client.executeBillQueryAll('PRD_MO', {
+      fieldKeys: extendedKeys,
+      filter: `FDate >= '${year}-01-01' AND FDate <= '${year}-12-31' AND FPRDORGID.FNumber = 'YJY'`,
+      orderString: 'FDate ASC',
+    });
+
+    if (!Array.isArray(rawResult) || rawResult.length === 0) {
+      console.log(`[agg] PRD_MO 查询结果为空`);
+      this._cache.set(cacheKey, { data: 0, timestamp: Date.now() });
+      return 0;
+    }
+
+    // 解析 2D 数组：跳过可能的表头行
+    let dataStart = 0;
+    if (Array.isArray(rawResult[0])) {
+      const hasHeader = rawResult[0].some(h => typeof h === 'string' && /^F[A-Z]/.test(h));
+      if (hasHeader) dataStart = 1;
+    }
+
+    // 列索引：FBillNo=0, FDate=1, FQty=2, FMaterialId.FNumber=3
+    const MATERIAL_COL = PRD_MO_FIELD_KEYS.length;
+    let total = 0;
+
+    for (let i = dataStart; i < rawResult.length; i++) {
+      const row = rawResult[i];
+      if (!row) continue;
+      const materialCode = row[MATERIAL_COL];
+      if (materialCode && String(materialCode).includes('MP')) {
+        total += parseFloat(row[2]) || 0;
+      }
+    }
+
+    console.log(`[agg] PRD_MO 汇总: MP 物料订单计划总量 = ${total}`);
+    this._cache.set(cacheKey, { data: total, timestamp: Date.now() });
+    return total;
   }
 
   // ===================== 数据获取与解析 =====================
@@ -436,6 +548,8 @@ class AggregationEngine {
         // 同步后清除内存缓存，下次请求会重新聚合
         this._cache.clear();
       }
+      // 通知外部监听（清除响应缓存等）
+      if (this._onSync) this._onSync();
     }).catch((err) => {
       console.warn(`[agg] 后台同步失败: ${err.message}`);
     });
@@ -755,6 +869,31 @@ class AggregationEngine {
   }
 
   /**
+   * 重映射车间名称：将已合并的车间记录重命名为目标车间
+   * 当前：Y固体一2号车间 → Y固体一1号车间
+   * 必须在聚合之前、车间名称解析之后调用
+   */
+  _remapWorkshopNames(records) {
+    const REMAP = {
+      'Y固体一2号车间': 'Y固体一1号车间',
+    };
+    let count = 0;
+    for (const r of records) {
+      const newName = r.workshop && REMAP[r.workshop];
+      if (newName) {
+        r.workshop = newName;
+        if (r.fields && r.fields['F_YJY_NewRealShop']) {
+          r.fields['F_YJY_NewRealShop'] = newName;
+        }
+        count++;
+      }
+    }
+    if (count > 0) {
+      console.log(`[agg] 车间名称重映射: ${count} 条记录 (Y固体一2号车间 → Y固体一1号车间)`);
+    }
+  }
+
+  /**
    * 标准化记录：班次映射、数值字段解析
    */
   _normalizeRecords(records) {
@@ -793,15 +932,18 @@ class AggregationEngine {
    * 按维度聚合全部记录
    * @param {Array} records - 标准化后的记录
    * @param {string} dimension
+   * @param {number} [year]
+   * @param {string} [startDate] - 可选日期范围起始
+   * @param {string} [endDate] - 可选日期范围结束
    * @returns {object} 聚合结果
    */
-  _aggregate(records, dimension, year) {
+  _aggregate(records, dimension, year, startDate, endDate, powerDataMap) {
     if (records.length === 0) {
-      return this._emptyResult(dimension, year);
+      return this._emptyResult(dimension, year, startDate, endDate);
     }
 
     // 按 (workshop, date) 分组计算每日车间级指标
-    const dailyWorkshopMap = this._computeDailyWorkshopMetrics(records);
+    const dailyWorkshopMap = this._computeDailyWorkshopMetrics(records, powerDataMap);
     // 按 (machine, date) 分组计算每日设备级指标
     const dailyEquipmentMap = this._computeDailyEquipmentMetrics(records);
 
@@ -816,6 +958,13 @@ class AggregationEngine {
       monthlyEquipmentData = this._aggregateToPeriods(dailyEquipmentMap, 'month', 'equipment');
     }
 
+    // 日期范围下保留日粒度数据供趋势图使用
+    let dailyWorkshopTrend, dailyEquipmentTrend;
+    if (startDate && endDate) {
+      dailyWorkshopTrend = dailyWorkshopMap;
+      dailyEquipmentTrend = dailyEquipmentMap;
+    }
+
     // 汇总全厂
     // 提取API响应并转换比率值为百分比（0-1 → 0-100）
     const summary = this._computeSummary(workshopPeriods, equipmentPeriods, dimension);
@@ -823,10 +972,14 @@ class AggregationEngine {
     return {
       dimension,
       year,
+      startDate,
+      endDate,
       workshopPeriods,
       equipmentPeriods,
       monthlyWorkshopData,
       monthlyEquipmentData,
+      dailyWorkshopTrend,
+      dailyEquipmentTrend,
       summary,
     };
   }
@@ -840,7 +993,7 @@ class AggregationEngine {
    * @param {Array} records
    * @returns {Map<string, object>} key = `${workshop}|${date}`
    */
-  _computeDailyWorkshopMetrics(records) {
+  _computeDailyWorkshopMetrics(records, powerDataMap) {
     // 收集车间每天的所有负荷工时（金蝶 F_UNW_WorkType2 班次字段大部分为空，
     // 无法依赖班次区分，改用 top-2 最大值之和估算双班负荷）
     const loadBuckets = new Map();   // key = `${ws}|${date}` => loadTimes array
@@ -906,6 +1059,49 @@ class AggregationEngine {
         aimProd: ob.aimProd,
         outputRate,
       });
+    }
+
+    // ===== 基于电表数据的车间负载率覆盖 =====
+    if (powerDataMap && powerDataMap.size > 0) {
+      const REMAP = { 'Y固体一2号车间': 'Y固体一1号车间' };
+
+      // 1) 覆盖已有生产记录日的负载率
+      // 注意：仅当电表数据确实包含该日期的记录时才覆盖，否则保留生产数据计算的负荷率
+      for (const [, daily] of dailyMap) {
+        const wsPowerMap = powerDataMap.get(daily.workshop);
+        if (!wsPowerMap) continue;
+        if (!wsPowerMap.has(daily.date)) continue; // 无该日电表数据时跳过覆盖
+        const kwh = wsPowerMap.get(daily.date);
+        const th = WORKSHOP_LOAD_RATE_THRESHOLDS[daily.workshop];
+        if (!th) continue;
+        const rate = kwh < th.low ? 0 : (kwh <= th.high ? 0.5 : 1.0);
+        daily.dailyLoadRate = rate;
+        daily.dailyActualHours = rate * DAILY_MAX_HOURS;
+      }
+
+      // 2) 补充有电表数据但无生产记录的日（仅负载率，产出率为 0）
+      for (let [ws, dateMap] of powerDataMap) {
+        ws = REMAP[ws] || ws;
+        if (!WORKSHOP_SET.has(ws)) continue;
+        const th = WORKSHOP_LOAD_RATE_THRESHOLDS[ws];
+        if (!th) continue;
+        for (const [date, kwh] of dateMap) {
+          const key = `${ws}|${date}`;
+          if (dailyMap.has(key)) continue;
+          const rate = kwh < th.low ? 0 : (kwh <= th.high ? 0.5 : 1.0);
+          dailyMap.set(key, {
+            workshop: ws,
+            date,
+            dayShiftMaxLoad: 0,
+            nightShiftMaxLoad: 0,
+            dailyActualHours: rate * DAILY_MAX_HOURS,
+            dailyLoadRate: rate,
+            quaQty: 0,
+            aimProd: 0,
+            outputRate: 0,
+          });
+        }
+      }
     }
 
     return dailyMap;
@@ -1033,6 +1229,7 @@ class AggregationEngine {
           groupKey,
           periodKey,
           dailyHours: [],
+          dailyLoadRates: [],
           totalQuaQty: 0,
           totalAimProd: 0,
           oeeWeightedSum: 0,
@@ -1051,6 +1248,7 @@ class AggregationEngine {
 
       const bucket = periodBuckets.get(bucketKey);
       bucket.dailyHours.push(daily.dailyActualHours);
+      bucket.dailyLoadRates.push(daily.dailyLoadRate);
       bucket.totalQuaQty += daily.quaQty;
       bucket.totalAimProd += daily.aimProd;
       const dQuaQty = daily.quaQty || 0;
@@ -1098,8 +1296,18 @@ class AggregationEngine {
       }
 
       const sumDailyHours = bucket.dailyHours.reduce((a, b) => a + b, 0);
-      const denominator = workingDays * DAILY_MAX_HOURS;
-      const loadRate = denominator > 0 ? Math.min(sumDailyHours / denominator, 1) : 0;
+      let loadRate;
+      if (type === 'workshop') {
+        // 车间负载率 = 每日负载率（电表衍生）的平均值
+        const dailyRates = bucket.dailyLoadRates || [];
+        loadRate = dailyRates.length > 0
+          ? Math.min(dailyRates.reduce((a, b) => a + b, 0) / dailyRates.length, 1)
+          : 0;
+      } else {
+        // 设备负载率保持原公式：总工时 / (工作天数 × 22.5h)
+        const denominator = workingDays * DAILY_MAX_HOURS;
+        loadRate = denominator > 0 ? Math.min(sumDailyHours / denominator, 1) : 0;
+      }
       const outputRate = bucket.totalAimProd > 0 ? Math.min(bucket.totalQuaQty / bucket.totalAimProd, 1) : 0;
 
       resultMap.set(bucketKey, {
@@ -1177,10 +1385,39 @@ class AggregationEngine {
   /**
    * 生成从年初到当前时段的所有period key列表
    * 用于填充趋势图中缺失的时段（无数据的时段显示为0）
+   * @param {string} dimension - 'day' | 'week' | 'month' | 'year'
+   * @param {number} [year]
+   * @param {string} [startDate] - 可选日期范围起始
+   * @param {string} [endDate] - 可选日期范围结束
    */
-  _generateAllPeriodKeys(dimension, year) {
+  _generateAllPeriodKeys(dimension, year, startDate, endDate) {
     const now = new Date();
     const targetYear = year || now.getFullYear();
+    const fmtLocal = (dt) => {
+      const y = dt.getFullYear();
+      const m = String(dt.getMonth() + 1).padStart(2, '0');
+      const d = String(dt.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    };
+
+    // 指定日期范围：在该范围内生成 key
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      const keys = [];
+      if (dimension === 'day') {
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          keys.push(fmtLocal(d));
+        }
+      } else {
+        // 非 day 维度但指定了日期范围（当前不会发生，extract 中会降级为 day）
+        for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+          keys.push(fmtLocal(d));
+        }
+      }
+      return keys;
+    }
+
     const isCurrentYear = targetYear === now.getFullYear();
     const keys = [];
 
@@ -1190,8 +1427,8 @@ class AggregationEngine {
         keys.push(`${targetYear}-${String(m).padStart(2, '0')}`);
       }
     } else if (dimension === 'week') {
-      const endDate = isCurrentYear ? now : new Date(targetYear, 11, 31);
-      const maxWeek = getISOWeekNumber(endDate);
+      const endDate2 = isCurrentYear ? now : new Date(targetYear, 11, 31);
+      const maxWeek = getISOWeekNumber(endDate2);
       for (let w = 1; w <= maxWeek; w++) {
         keys.push(`${targetYear}-W${String(w).padStart(2, '0')}`);
       }
@@ -1201,12 +1438,6 @@ class AggregationEngine {
       // day: 当年从年初至年末/今天
       const start = new Date(targetYear, 0, 1);
       const end = isCurrentYear ? now : new Date(targetYear, 11, 31);
-      const fmtLocal = (dt) => {
-        const y = dt.getFullYear();
-        const m = String(dt.getMonth() + 1).padStart(2, '0');
-        const d = String(dt.getDate()).padStart(2, '0');
-        return `${y}-${m}-${d}`;
-      };
       for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
         keys.push(fmtLocal(d));
       }
@@ -1217,10 +1448,12 @@ class AggregationEngine {
   /**
    * 空结果
    */
-  _emptyResult(dimension, year) {
+  _emptyResult(dimension, year, startDate, endDate) {
     return {
       dimension,
       year,
+      startDate,
+      endDate,
       workshopPeriods: new Map(),
       equipmentPeriods: new Map(),
       summary: {
@@ -1287,9 +1520,13 @@ class AggregationEngine {
     workshops.sort((a, b) => a.name.localeCompare(b.name));
 
     // 产出趋势：从年初到当前所有时段，无数据的填0
-    const trendDim = dimension === 'year' ? 'month' : dimension;
-    const trendWsData = dimension === 'year' ? aggregated.monthlyWorkshopData : workshopPeriods;
-    const trendEqData = dimension === 'year' ? aggregated.monthlyEquipmentData : aggregated.equipmentPeriods;
+    // 有日期范围时降级为日粒度展示期间内每日数据
+    const hasDateRange = !!(aggregated.startDate && aggregated.endDate);
+    const trendDim = hasDateRange ? 'day' : (dimension === 'year' ? 'month' : dimension);
+    const trendWsData = hasDateRange ? (aggregated.dailyWorkshopTrend || workshopPeriods)
+      : (dimension === 'year' ? aggregated.monthlyWorkshopData : workshopPeriods);
+    const trendEqData = hasDateRange ? (aggregated.dailyEquipmentTrend || aggregated.equipmentPeriods)
+      : (dimension === 'year' ? aggregated.monthlyEquipmentData : aggregated.equipmentPeriods);
 
     const outputByPeriod = new Map();
     for (const [, period] of trendWsData) {
@@ -1300,7 +1537,7 @@ class AggregationEngine {
       const output = period.quaQty !== undefined ? period.quaQty : (period.totalQuaQty || 0);
       outputByPeriod.set(dateKey, (outputByPeriod.get(dateKey) || 0) + output);
     }
-    const allPeriodKeys = this._generateAllPeriodKeys(trendDim, year);
+    const allPeriodKeys = this._generateAllPeriodKeys(trendDim, year, aggregated.startDate, aggregated.endDate);
     const outputTrend = allPeriodKeys.map(pk => {
       const label = dimension === 'year'
         ? `${parseInt(pk.slice(5, 7), 10)}月`
@@ -1353,6 +1590,62 @@ class AggregationEngine {
     for (const period of latestPeriods) {
       latestTotalOutput += (period.quaQty || period.totalQuaQty || 0);
     }
+
+    // ====== 设备列表提取 ======
+    const equipmentMap = new Map(); // name → { totalOutput, totalAimProd, loadRateSum, loadRateCount, oeeWS, oeeWD, totalLoadHours }
+    for (const [, period] of aggregated.equipmentPeriods) {
+      const pk = period.periodKey || period.date;
+      if (pk !== latestKey) continue;
+      const eqName = period.machine || period.groupKey;
+      if (!eqName) continue;
+
+      const quaQty = period.totalQuaQty !== undefined ? period.totalQuaQty : (period.quaQty || 0);
+      const aimProd = period.totalAimProd !== undefined ? period.totalAimProd : (period.aimProd || 0);
+      const loadRate = period.loadRate !== undefined ? period.loadRate : (period.dailyLoadRate || 0);
+      const oeeVal = period.oee || 0;
+      const loadHours = period.sumDailyHours !== undefined ? period.sumDailyHours : (period.dailyActualHours || 0);
+
+      if (!equipmentMap.has(eqName)) {
+        equipmentMap.set(eqName, { totalOutput: 0, totalAimProd: 0, loadRateSum: 0, loadRateCount: 0, oeeWS: 0, oeeWD: 0, totalLoadHours: 0 });
+      }
+      const eq = equipmentMap.get(eqName);
+      eq.totalOutput += quaQty;
+      eq.totalAimProd += aimProd;
+      eq.loadRateSum += loadRate;
+      eq.loadRateCount++;
+      eq.totalLoadHours += loadHours;
+      if (oeeVal > 0 && quaQty > 0) {
+        eq.oeeWS += oeeVal * quaQty;
+        eq.oeeWD += quaQty;
+      }
+    }
+
+    const equipmentList = [];
+    for (const [name, eq] of equipmentMap) {
+      const eqInfo = getEquipmentByName(name);
+      const outRate = eq.totalAimProd > 0 ? +((eq.totalOutput / eq.totalAimProd) * 100).toFixed(1) : 0;
+      const avgLoadRate = eq.loadRateCount > 0 ? +((eq.loadRateSum / eq.loadRateCount) * 100).toFixed(1) : 0;
+      const avgOee = eq.oeeWD > 0 ? +((eq.oeeWS / eq.oeeWD).toFixed(1)) : 0;
+      equipmentList.push({
+        name,
+        output: Math.round(eq.totalOutput),
+        outputRate: outRate,
+        loadRate: avgLoadRate,
+        totalLoadHours: +eq.totalLoadHours.toFixed(1),
+        oee: avgOee,
+        status: outRate >= 85 ? 'health' : outRate >= 70 ? 'warning' : 'danger',
+        type: eqInfo ? eqInfo.type : '未知',
+        lanes: eqInfo ? eqInfo.lanes : null,
+        designSpeed: eqInfo ? eqInfo.designSpeed : null,
+      });
+    }
+    // 按产出率降序排列，产出率为 0 的排末尾
+    equipmentList.sort((a, b) => {
+      if (a.outputRate === 0 && b.outputRate === 0) return a.name.localeCompare(b.name);
+      if (a.outputRate === 0) return 1;
+      if (b.outputRate === 0) return -1;
+      return b.outputRate - a.outputRate;
+    });
 
     // 从设备维度计算加权平均（跨车间合并同一设备）
     let overviewWorkingDays = 0;
@@ -1423,6 +1716,7 @@ class AggregationEngine {
       avgOutputRate,
       avgOEE,
       workshops,
+      equipmentList,
       outputTrend,
       loadRateTrend,
       outputRateComparison,
@@ -1518,28 +1812,50 @@ class AggregationEngine {
     }
     wsPeriods.sort((a, b) => a.periodKey.localeCompare(b.periodKey));
 
-    // 填充缺失时段（无数据则显示0）
-    const wsPeriodMap = new Map(wsPeriods.map(p => [p.periodKey, p]));
-    const allPeriodKeys = this._generateAllPeriodKeys(aggregated.dimension, year);
-    const filledPeriods = allPeriodKeys.map(pk => {
-      const existing = wsPeriodMap.get(pk);
-      return existing || {
-        periodKey: pk,
-        loadRate: 0,
-        outputRate: 0,
-        totalOutput: 0,
-        aimProd: 0,
-      };
-    });
+    // 汇总指标：有日期范围时累加该范围内所有期间，否则取最新期间
+    let totalOutput, theoreticalOutput, avgOutputRate, avgLoadRate;
+    if (aggregated.startDate) {
+      let sumOutput = 0, sumAimProd = 0, loadRateSum = 0, loadRateCount = 0;
+      for (const [, period] of aggregated.workshopPeriods) {
+        if (period.workshop !== workshopName) continue;
+        sumOutput += period.quaQty !== undefined ? period.quaQty : (period.totalQuaQty || 0);
+        sumAimProd += period.aimProd !== undefined ? period.aimProd : (period.totalAimProd || 0);
+        const lr = period.loadRate !== undefined ? period.loadRate : (period.dailyLoadRate || 0);
+        loadRateSum += lr;
+        loadRateCount++;
+      }
+      totalOutput = Math.round(sumOutput);
+      theoreticalOutput = Math.round(sumAimProd);
+      avgOutputRate = sumAimProd > 0
+        ? +((sumOutput / sumAimProd) * 100).toFixed(1)
+        : 0;
+      avgLoadRate = loadRateCount > 0
+        ? +((loadRateSum / loadRateCount) * 100).toFixed(1)
+        : 0;
+    } else {
+      // 填充缺失时段（无数据则显示0）
+      const wsPeriodMap = new Map(wsPeriods.map(p => [p.periodKey, p]));
+      const allPeriodKeys = this._generateAllPeriodKeys(aggregated.dimension, year);
+      const filledPeriods = allPeriodKeys.map(pk => {
+        const existing = wsPeriodMap.get(pk);
+        return existing || {
+          periodKey: pk,
+          loadRate: 0,
+          outputRate: 0,
+          totalOutput: 0,
+          aimProd: 0,
+        };
+      });
 
-    // 取最新时段（包含无数据的时段，显示为 0）
-    const latestPeriod = filledPeriods.length > 0 ? filledPeriods[filledPeriods.length - 1] : null;
-    const totalOutput = latestPeriod ? latestPeriod.totalOutput : 0;
-    const theoreticalOutput = latestPeriod ? latestPeriod.aimProd : 0;
-    const avgOutputRate = theoreticalOutput > 0
-      ? +((totalOutput / theoreticalOutput) * 100).toFixed(1)
-      : 0;
-    const avgLoadRate = latestPeriod ? latestPeriod.loadRate : 0;
+      // 取最新时段（包含无数据的时段，显示为 0）
+      const latestPeriod = filledPeriods.length > 0 ? filledPeriods[filledPeriods.length - 1] : null;
+      totalOutput = latestPeriod ? latestPeriod.totalOutput : 0;
+      theoreticalOutput = latestPeriod ? latestPeriod.aimProd : 0;
+      avgOutputRate = theoreticalOutput > 0
+        ? +((totalOutput / theoreticalOutput) * 100).toFixed(1)
+        : 0;
+      avgLoadRate = latestPeriod ? latestPeriod.loadRate : 0;
+    }
 
     // 从设备维度提取该车间最新时段设备列表（仅限目标年份）
     let equipLatestKey = '';
@@ -1589,9 +1905,11 @@ class AggregationEngine {
     equipmentList.sort((a, b) => a.name.localeCompare(b.name));
 
     // 趋势数组（全量历史，缺失时段填0）
-    const trendDim = aggregated.dimension === 'year' ? 'month' : aggregated.dimension;
-    const trendPeriodKeys = this._generateAllPeriodKeys(trendDim, year);
-    const trendWsData = aggregated.dimension === 'year' ? aggregated.monthlyWorkshopData : aggregated.workshopPeriods;
+    const hasDateRange = !!(aggregated.startDate && aggregated.endDate);
+    const trendDim = hasDateRange ? 'day' : (aggregated.dimension === 'year' ? 'month' : aggregated.dimension);
+    const trendPeriodKeys = this._generateAllPeriodKeys(trendDim, year, aggregated.startDate, aggregated.endDate);
+    const trendWsData = hasDateRange ? (aggregated.dailyWorkshopTrend || aggregated.workshopPeriods)
+      : (aggregated.dimension === 'year' ? aggregated.monthlyWorkshopData : aggregated.workshopPeriods);
 
     const trendPeriodMap = new Map();
     for (const [, period] of trendWsData) {
@@ -1697,8 +2015,10 @@ class AggregationEngine {
     }
 
     // 填充缺失时段
-    const trendDim = aggregated.dimension === 'year' ? 'month' : aggregated.dimension;
-    const trendEqSrc = aggregated.dimension === 'year' ? aggregated.monthlyEquipmentData : aggregated.equipmentPeriods;
+    const hasDateRange = !!(aggregated.startDate && aggregated.endDate);
+    const trendDim = hasDateRange ? 'day' : (aggregated.dimension === 'year' ? 'month' : aggregated.dimension);
+    const trendEqSrc = hasDateRange ? (aggregated.dailyEquipmentTrend || aggregated.equipmentPeriods)
+      : (aggregated.dimension === 'year' ? aggregated.monthlyEquipmentData : aggregated.equipmentPeriods);
 
     // 从趋势数据源过滤本设备记录
     const trendPeriodsMap = new Map();
@@ -1731,7 +2051,7 @@ class AggregationEngine {
     }));
 
     const trendMap = new Map(trendList.map(p => [p.periodKey, p]));
-    const allPeriodKeys = this._generateAllPeriodKeys(trendDim, year);
+    const allPeriodKeys = this._generateAllPeriodKeys(trendDim, year, aggregated.startDate, aggregated.endDate);
     const filledTrends = allPeriodKeys.map(pk => {
       const existing = trendMap.get(pk);
       return existing || {
@@ -1743,9 +2063,24 @@ class AggregationEngine {
       };
     });
 
-    // 汇总指标：年维度用全年聚合数据，其他维度取最新时段
+    // 汇总指标：有日期范围时累加该范围内所有期间，否则按维度取最新
     let actualOutput, avgLoadRate, avgOutRate, avgOee;
-    if (aggregated.dimension === 'year') {
+    if (aggregated.startDate) {
+      let sumOutput = 0, sumAimProd = 0;
+      let sumOeeWeighted = 0, sumOeeWeight = 0;
+      let maxLoadRate = 0;
+      for (const period of mergedMap.values()) {
+        sumOutput += period.totalOutput;
+        sumAimProd += period.totalAimProd;
+        if (period.maxLoadRate > maxLoadRate) maxLoadRate = period.maxLoadRate;
+        sumOeeWeighted += period.oeeWeightedSum;
+        sumOeeWeight += period.oeeWeightDenom;
+      }
+      actualOutput = Math.round(sumOutput);
+      avgLoadRate = this._pct(maxLoadRate);
+      avgOutRate = sumAimProd > 0 ? this._pct(sumOutput / sumAimProd) : 0;
+      avgOee = sumOeeWeight > 0 ? +(sumOeeWeighted / sumOeeWeight).toFixed(1) : 0;
+    } else if (aggregated.dimension === 'year') {
       const yearKey = String(year || new Date().getFullYear());
       const yearPeriod = mergedMap.get(yearKey);
       if (yearPeriod) {
@@ -1841,6 +2176,34 @@ class AggregationEngine {
   clearCache() {
     this._cache.clear();
     console.log('[agg] 缓存已清除');
+  }
+
+  /**
+   * 手动触发一次同步并等待完成
+   * 返回同步记录数，用于前端反馈
+   */
+  async syncNow() {
+    if (!this.db) throw new Error('SQLite 未初始化');
+    const records = await this._syncFromKingdee();
+    this._cache.clear();
+    if (this._onSync) this._onSync();
+    return { count: records.length };
+  }
+
+  /**
+   * 注册同步完成回调（用于清除外部缓存等）
+   */
+  onSync(cb) {
+    this._onSync = cb;
+  }
+
+  /**
+   * 注入电表数据服务（用于车间负载率基于电量的计算）
+   * @param {import('./powerSyncService')} ps
+   */
+  setPowerService(ps) {
+    this.powerService = ps;
+    console.log('[agg] 电表数据服务已注入');
   }
 
   // ===================== 文件缓存持久化 =====================
