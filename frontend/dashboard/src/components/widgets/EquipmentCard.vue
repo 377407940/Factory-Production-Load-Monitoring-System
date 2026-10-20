@@ -65,6 +65,7 @@ const loadRateColor = computed(() => {
   if (props.loadRate >= 70) return '#3B82F6'
   return '#6B7280'
 })
+
 </script>
 
 <template>
@@ -141,6 +142,9 @@ const loadRateColor = computed(() => {
           {{ oee > 0 ? oee.toFixed(1) + '%' : '--' }}
         </span>
       </div>
+
+      <!-- 底部弹性空间：吸收多余空间，确保空白留在最底部 -->
+      <div class="card-spacer"></div>
     </div>
   </div>
 </template>
@@ -285,7 +289,6 @@ const loadRateColor = computed(() => {
   gap: 6px;
   padding-top: 6px;
   border-top: 1px solid var(--border-color, #E2E8F0);
-  margin-top: auto;
 }
 
 .footer-label {
@@ -304,4 +307,9 @@ const loadRateColor = computed(() => {
 .oee-good { color: #22C55E; }
 .oee-mid { color: #F59E0B; }
 .oee-low { color: #EF4444; }
+
+/* ===== 底部弹性空间 ===== */
+.card-spacer {
+  flex: 1;
+}
 </style>

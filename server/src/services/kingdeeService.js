@@ -154,10 +154,20 @@ class KingdeeClient {
         rows = rows.Result;
       }
 
-      // 情况2: 空响应或非数组
-      if (!Array.isArray(rows) || rows.length === 0) {
+      // 情况2a: 非数组 → 是异常响应（金蝶报错时会把错误当字符串/对象返回），必须抛错而不是当成"没数据"
+      // 以前这里静默 break 当成空结果，调用方（如 PRD_INSTOCK 同步）会误以为"金蝶确实没数据"，
+      // 而它又是先删后拉 → 31 天数据被清空。2026-10-10 实际发生过。
+      if (!Array.isArray(rows)) {
+        const preview = typeof result.data === 'string'
+          ? result.data.slice(0, 300)
+          : JSON.stringify(result.data || null).slice(0, 300);
+        throw new Error(`金蝶返回格式异常 formId=${formId} dataType=${typeof result.data}：${preview}`);
+      }
+
+      // 情况2b: 空数组 → 真的没有数据
+      if (rows.length === 0) {
         if (page === 0) {
-          console.error(`[kingdee] executeBillQueryAll 首页无数据 formId=${formId} dataType=${typeof result.data}`);
+          console.warn(`[kingdee] executeBillQueryAll 首页无数据 formId=${formId}`);
         }
         break;
       }
@@ -260,10 +270,13 @@ class KingdeeClient {
       };
 
       const req = http.request(options, (res) => {
-        let data = '';
+        // 用 Buffer.concat 而非 data += chunk：
+        // 字符串拼接会在 chunk 边界切断多字节 UTF-8 字符，产生 U+FFFD 乱码
+        const chunks = [];
         const cookies = res.headers['set-cookie'];
-        res.on('data', (chunk) => (data += chunk));
+        res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
+          const data = Buffer.concat(chunks).toString('utf8');
           try {
             resolve({ data: JSON.parse(data), cookies });
           } catch {

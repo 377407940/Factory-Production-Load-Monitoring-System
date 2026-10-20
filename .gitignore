@@ -4,3 +4,14 @@ dist/
 *.log
 .DS_Store
 Thumbs.db
+
+# 运行时数据与生成物（SQLite/WAL、缓存、报告图片）
+data/
+server/data/
+reports/
+*.db
+*.db-wal
+*.db-shm
+
+# 本地登录态/测试快照
+frontend/dashboard/login.json

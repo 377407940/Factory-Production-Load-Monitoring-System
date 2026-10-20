@@ -17,6 +17,43 @@ const WORKSHOPS = [
   'Y液体二车间',
 ];
 
+/**
+ * 金蝶部门现名 → 主数据标准名（别名归一化）
+ *
+ * 金蝶 BD_DEPARTMENT 里的车间名会被业务改动（2026-09 去掉/加了"号"字，
+ * 如 Y固体一1号车间 → Y固体一1车间、Y固体二车间 → Y固体二号车间）。
+ * 同步解析出的车间名必须先归一化成这里的标准名，否则按名字匹配会全部失配（产量归零）。
+ * 金蝶以后再改名，在此追加一行即可。
+ */
+const WORKSHOP_NAME_ALIASES = {
+  // 金蝶 BD_DEPARTMENT 部门名（改动后）
+  'Y固体一1车间': 'Y固体一1号车间',
+  'Y固体一2车间': 'Y固体一2号车间',
+  'Y固体一3车间': 'Y固体一3号车间',
+  'Y固体一5车间': 'Y固体一5号车间',
+  'Y固体一6车间': 'Y固体一6号车间',
+  'Y固体一8车间': 'Y固体一8号车间',
+  'Y分包间': 'Y固体一分包间',
+  'Y固体二号车间': 'Y固体二车间',
+  'Y液体二号车间': 'Y液体二车间',
+  // MES dev_dict 的车间标签（无 Y 前缀）
+  '固体一1车间': 'Y固体一1号车间',
+  '固体一2车间': 'Y固体一2号车间',
+  '固体一3车间': 'Y固体一3号车间',
+  '固体一5车间': 'Y固体一5号车间',
+  '固体一6车间': 'Y固体一6号车间',
+  '固体一8车间': 'Y固体一8号车间',
+  '分包间': 'Y固体一分包间',
+  '固体二号车间': 'Y固体二车间',
+  '液体二号车间': 'Y液体二车间',
+};
+
+/** 把金蝶解析出的车间名归一化成主数据标准名（无别名时原样返回） */
+function normalizeWorkshopName(name) {
+  if (!name) return name;
+  return WORKSHOP_NAME_ALIASES[String(name).trim()] || name;
+}
+
 /** 车间面积（㎡） */
 const WORKSHOP_AREAS = {
   'Y固体一1号车间': 300, // 245（原1号）+ 55（原2号，已合并）
@@ -45,6 +82,8 @@ const EQUIPMENT_LIST = [
   // === 粉体设备 ===
   { name: '粉体12列机P机台',   type: '粉体', defaultWorkshop: 'Y固体二车间',     lanes: 12, designSpeed: 60 },
   { name: '粉体24.3十列机',    type: '粉体', defaultWorkshop: 'Y固体二车间',     lanes: 10, designSpeed: 40 },
+  { name: 'S100（24.3十二列机）', type: '粉体', defaultWorkshop: 'Y固体二车间',   lanes: 12, designSpeed: 40 },
+  { name: '45.1可变袋宽六列机', type: '粉体', defaultWorkshop: '',                lanes: 6,  designSpeed: 40 },
   { name: '粉体45.1八列机',    type: '粉体', defaultWorkshop: '',                lanes: 8,  designSpeed: 35 },
   { name: '粉体A机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
   { name: '粉体B机台',         type: '粉体', defaultWorkshop: 'Y固体一1号车间',  lanes: 1,  designSpeed: 40 },
@@ -112,6 +151,8 @@ const WORKSHOP_LOAD_RATE_THRESHOLDS = {
 
 module.exports = {
   WORKSHOPS,
+  WORKSHOP_NAME_ALIASES,
+  normalizeWorkshopName,
   WORKSHOP_AREAS,
   EQUIPMENT_TYPES,
   EQUIPMENT_LIST,

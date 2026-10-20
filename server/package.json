@@ -15,6 +15,8 @@
     "express": "^4.21.0",
     "jsonwebtoken": "^9.0.3",
     "node-cron": "^4.2.1",
+    "puppeteer-core": "23.11.1",
+    "sharp": "0.34.4",
     "sm-crypto": "^0.4.0"
   }
 }

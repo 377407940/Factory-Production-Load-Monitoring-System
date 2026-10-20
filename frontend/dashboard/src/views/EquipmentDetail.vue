@@ -6,6 +6,8 @@ import MetricCard from '../components/widgets/MetricCard.vue'
 import TrendLine from '../components/charts/TrendLine.vue'
 import BarChart from '../components/charts/BarChart.vue'
 import PeriodSelector from '../components/widgets/PeriodSelector.vue'
+import ProductTable from '../components/widgets/ProductTable.vue'
+import { getAvailableYears } from '../utils/years'
 
 const chartColors = ['#1890ff', '#52c41a', '#faad14', '#ff4d4f', '#722ed1', '#13c2c2', '#eb2f96', '#fa8c16']
 
@@ -21,7 +23,7 @@ const dimensions = [
 
 const currentDimension = ref(route.query.dimension || 'day')
 const currentYear = ref(parseInt(route.query.year) || new Date().getFullYear())
-const availableYears = [2025, 2026]
+const availableYears = getAvailableYears()
 const loading = ref(true)
 const detailData = ref(null)
 const periodSelectorRef = ref(null)
@@ -168,6 +170,12 @@ watch(
         color="#722ed1"
       />
     </div>
+
+    <!-- 产品信息卡片（表格） -->
+    <ProductTable
+      :products="detailData?.currentProducts || []"
+      title="当前生产产品"
+    />
 
     <!-- 图表区域 -->
 

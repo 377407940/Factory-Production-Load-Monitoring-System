@@ -9,6 +9,10 @@ const props = defineProps({
   targetLine: { type: Number, default: null },
   lineColor: { type: String, default: '#1890ff' },
   multiSeries: { type: Array, default: null },
+  // 简单 tooltip：只显示日期/标签 + 未达产原因，不显示各系列圆点/名称/数值
+  simpleTooltip: { type: Boolean, default: false },
+  // Y 轴最大值（如 OES 固定 100）
+  yAxisMax: { type: Number, default: null },
 })
 
 const chartRef = ref(null)
@@ -88,9 +92,34 @@ function renderChart() {
       formatter: (params) => {
         if (!params || params.length === 0) return ''
         const item = isMulti ? (props.multiSeries[0].data || [])[params[0].dataIndex] : props.data[params[0].dataIndex]
+        // 简单模式：只显示日期 + 未达产原因（不显示各产品圆点/名称/数值）
+        if (props.simpleTooltip) {
+          let html = `${item ? item.label : ''}<br/>`
+          const seen = new Set()
+          if (isMulti) {
+            for (const p of params) {
+              const arr = props.multiSeries[p.seriesIndex] ? props.multiSeries[p.seriesIndex].data : null
+              const dp = arr ? arr[p.dataIndex] : null
+              if (dp && dp.reason && !seen.has(dp.reason)) {
+                seen.add(dp.reason)
+                html += `<span style="color:#EF4444;font-size:11px">未达产原因：${String(dp.reason).replace(/\n/g, '<br/>')}</span><br/>`
+              }
+            }
+          }
+          return html
+        }
         let html = `${item ? item.label : ''}<br/>`
         params.forEach((p) => {
-          html += `${p.marker} ${p.seriesName || ''} ${p.value}<br/>`
+          html += `${p.marker} ${p.seriesName || ''} ${p.value}`
+          // 数据点携带未达产原因时在 tooltip 中展示（直接读 props 数据：ECharts 会对带 label 字段的数据项规范化，p.data 可能丢失自定义字段）
+          if (isMulti && p.seriesIndex != null) {
+            const arr = props.multiSeries[p.seriesIndex] ? props.multiSeries[p.seriesIndex].data : null
+            const dp = arr ? arr[p.dataIndex] : null
+            if (dp && dp.reason) {
+              html += `<br/><span style="color:#EF4444;font-size:11px">未达产原因：${String(dp.reason).replace(/\n/g, '<br/>')}</span>`
+            }
+          }
+          html += `<br/>`
         })
         return html
       },
@@ -106,13 +135,15 @@ function renderChart() {
     },
     yAxis: {
       type: 'value',
+      max: props.yAxisMax !== null && props.yAxisMax !== undefined ? props.yAxisMax : undefined,
       splitLine: { lineStyle: { color: '#F1F5F9', type: 'dashed' } },
       axisLabel: { color: '#94A3B8', fontSize: 11 },
     },
     series,
   }
 
-  chartInstance.setOption(option)
+  // notMerge: 全量替换，避免筛选变化后旧序列残留
+  chartInstance.setOption(option, { notMerge: true })
 }
 
 function handleResize() {
@@ -131,7 +162,7 @@ onBeforeUnmount(() => {
 })
 
 watch(
-  () => [props.data, props.title, props.targetLine],
+  () => [props.data, props.title, props.targetLine, props.multiSeries],
   () => {
     nextTick(renderChart)
   },

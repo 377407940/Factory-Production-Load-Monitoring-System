@@ -14,7 +14,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const config = require('../config');
 const { isWorkingDay, countWorkingDays, countWorkingDaysInMonth } = require('../config/holiday');
-const { WORKSHOPS, WORKSHOP_AREAS, EQUIPMENT_TYPES, EQUIPMENT_LIST, WORKSHOP_LOAD_RATE_THRESHOLDS, getEquipmentByName } = require('../config/workshopMasterData');
+const { WORKSHOPS, WORKSHOP_AREAS, EQUIPMENT_TYPES, EQUIPMENT_LIST, WORKSHOP_LOAD_RATE_THRESHOLDS, getEquipmentByName, normalizeWorkshopName } = require('../config/workshopMasterData');
 
 /** 文件缓存目录（相对项目根目录） */
 const CACHE_DIR = path.resolve(__dirname, '../../data/cache');
@@ -28,6 +28,19 @@ const EQUIPMENT_NAMES = new Set(EQUIPMENT_LIST.map(e => e.name));
 
 /** 每日额定负荷工时（两班制合计） */
 const DAILY_MAX_HOURS = 22.5;
+
+/**
+ * 金蝶「工序汇报」停用日：9/15 起不再有金蝶工序汇报数据。
+ * 金蝶侧只取 date < 该日的记录（即 FDate ≤ 9/14）。
+ */
+const MES_START_DATE = '2026-09-15';
+
+/**
+ * MES 侧取数下限（班次日期）：9/14 晚班是金蝶停用前最后停的一班，
+ * 金蝶里它记在 FDate=9/15（被上面滤掉），所以必须由 MES 补齐 9/14 全天。
+ * 两边按「班次日期」正好接上：金蝶 ≤ 9/13、MES ≥ 9/14，不重不漏。
+ */
+const MES_FROM_DATE = '2026-09-14';
 
 /** SFC_OperationReport 查询字段列表（顺序必须与 API 返回列一一对应） */
 const FIELD_KEYS = [
@@ -53,10 +66,19 @@ const FIELD_KEYS = [
   'FMoNumber',           // 19
   'F_FD_OkRates',        // 20
   'F_FD_OperDescp',      // 21
+  'F_FD_AimProducts',    // 22
+  'F_FD_Operator',       // 23
+  'F_FD_SALEORDERNUMBER', // 24  销售订单编号（需求单据编号），生产执行看板用
+  'F_UNW_REASON',        // 25  未达产原因（生产执行看板）
+  'F_UNW_SOLUTION',      // 26  后续补产方案（生产执行看板）
+  'F_UNW_Date2',         // 27  实际生产日期（生产执行看板，晚班跨天用）
+  'F_FD_WorkTimes',      // 28  正式工工时（配料&混料工序）
+  'F_YJY_PQWORKERTIME',  // 29  派遣工工时（灌装 / 配料&混料工序）
+  'F_FD_TXTWORKERS',     // 30  配料&混料操作人员（文本，多人以逗号/空格/点分隔或拼接）
 ];
 
-/** 内联解析的点符号字段（在 FIELD_KEYS 之后追加） */
-const DOT_FIELD = 'F_FD_Machine.FName';
+/** 内联解析的点符号字段列表（在 FIELD_KEYS 之后追加，顺序对应 rawResult 额外列） */
+const DOT_FIELDS = ['F_FD_Machine.FName', 'F_FD_Operator.FName'];
 
 /** 需要 parseFloat 的数值字段 */
 const NUMERIC_FIELDS = new Set([
@@ -64,6 +86,7 @@ const NUMERIC_FIELDS = new Set([
   'F_YJY_loadTimes', 'F_FD_EXCEPTTimes', 'F_FD_IMPORTTIMES',
   'F_FD_Speeds', 'F_YJY_equipSpeed', 'F_FD_OEE', 'F_YJY_OEE',
   'F_FD_AimPerProduct', 'F_FD_RealPerProduct', 'F_FD_OkRates',
+  'F_FD_AimProducts', 'F_FD_WorkTimes', 'F_YJY_PQWORKERTIME',
 ]);
 
 /** 班次映射 */
@@ -199,6 +222,19 @@ class AggregationEngine {
         console.warn(`[agg] SQLite 初始化失败，回退金蝶直连: ${err.message}`);
       }
     }
+
+    // MES 库（2026-09-14 起金蝶工序汇报停用，该日期及之后改用工厂 MES 推送的数据）
+    this.mesDb = null;
+    if (config.sqlite.enabled && this.db) {
+      try {
+        const Database = require('./database');
+        const mesPath = config.sqlite.mesPath || path.resolve(__dirname, '../../data/mes_records.db');
+        this.mesDb = new Database(mesPath);
+        this.mesDb.initialize();
+      } catch (err) {
+        console.warn(`[agg] MES SQLite 初始化失败（该日期后的数据将缺失）: ${err.message}`);
+      }
+    }
     this.SYNC_INTERVAL_MS = (config.sync.interval || 300) * 1000;
     this._syncTimer = null;
 
@@ -239,9 +275,21 @@ class AggregationEngine {
     if (this.db) {
       // 有 SQLite：从本地读取
       if (startDate && endDate) {
-        // 指定日期范围：按范围查询
-        records = this.db.getRecordsInRange(startDate, endDate);
-        console.log(`[agg] 按日期范围查询: ${startDate} ~ ${endDate}, ${records.length} 条`);
+        // 指定日期范围：按范围查询（金蝶只取切换日之前，切换日起取 MES）
+        const sfcRecords = this.db
+          .getRecordsInRange(startDate, endDate)
+          .filter((r) => r.date < MES_START_DATE);
+        // MES 记录按班次日期入库，归一成生产日期后最多会跨出区间 1 天，
+        // 所以读数前后各放宽一天，归一后再裁回区间（见下面 _toProduceDate）。
+        const mesRecords = this.mesDb
+          ? this.mesDb
+            .getRecordsInRange(this._prevDay(startDate), this._nextDay(endDate))
+            .filter((r) => r.date >= MES_FROM_DATE)
+          : [];
+        records = [...sfcRecords, ...mesRecords];
+        console.log(
+          `[agg] 按日期范围查询: ${startDate} ~ ${endDate}, ${records.length} 条（金蝶 ${sfcRecords.length} + MES ${mesRecords.length}）`,
+        );
       } else {
         records = this._readFromStorage();
         if (records.length === 0) {
@@ -261,6 +309,17 @@ class AggregationEngine {
     // 合并 Y固体一2号车间 → Y固体一1号车间（在聚合前重映射）
     this._remapWorkshopNames(records);
 
+    // 口径归一：总览/车间/设备一律按「生产日期」（晚班跨天算产出那天）。
+    // 生产执行看板不走这里——它直接读记录，按班次日期看每一班做了多少。
+    records = this._toProduceDate(records);
+    if (startDate && endDate) {
+      // 上面 MES 读数放宽了 1 天，这里裁回请求区间
+      records = records.filter((r) => r.date >= startDate && r.date <= endDate);
+    }
+
+    // 构建订单计划量索引（用于订单完成率）
+    const orderPlanMap = await this._buildOrderPlanMap(year || new Date().getFullYear());
+
     // 获取电表数据用于车间负载率计算
     let powerDataMap = null;
     if (this.powerService && this.powerService.isAvailable()) {
@@ -277,7 +336,7 @@ class AggregationEngine {
     }
 
     // 聚合计算
-    const aggregated = this._aggregate(records, dimension, year, startDate, endDate, powerDataMap);
+    const aggregated = this._aggregate(records, dimension, year, startDate, endDate, powerDataMap, orderPlanMap);
 
     // 缓存
     this._cache.set(cacheKey, { data: aggregated, timestamp: Date.now() });
@@ -399,6 +458,55 @@ class AggregationEngine {
     return total;
   }
 
+  /**
+   * 构建 PRD_MO 订单计划量索引 Map<FBillNo, FQty>
+   * 用于后续计算订单完成率
+   */
+  async _buildOrderPlanMap(year) {
+    const map = new Map();
+    if (!year) return map;
+
+    const cacheKey = `orderPlanMap_${year}`;
+    const cached = this._cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+      return cached.data;
+    }
+
+    console.log(`[agg] 构建 PRD_MO 订单索引 (year=${year})`);
+
+    try {
+      const extendedKeys = [...PRD_MO_FIELD_KEYS, PRD_MO_DOT_FIELD];
+      const rawResult = await this.client.executeBillQueryAll('PRD_MO', {
+        fieldKeys: extendedKeys,
+        filter: `FDate >= '${year}-01-01' AND FDate <= '${year}-12-31' AND FPRDORGID.FNumber = 'YJY'`,
+        orderString: 'FDate ASC',
+      });
+
+      if (Array.isArray(rawResult)) {
+        let dataStart = 0;
+        if (rawResult[0] && Array.isArray(rawResult[0])) {
+          const hasHeader = rawResult[0].some(h => typeof h === 'string' && /^F[A-Z]/.test(h));
+          if (hasHeader) dataStart = 1;
+        }
+        for (let i = dataStart; i < rawResult.length; i++) {
+          const row = rawResult[i];
+          if (!row) continue;
+          const billNo = String(row[0]).trim();
+          const qty = parseFloat(row[2]) || 0;
+          if (billNo && qty > 0) {
+            map.set(billNo, (map.get(billNo) || 0) + qty);
+          }
+        }
+        console.log(`[agg] PRD_MO 订单索引: ${map.size} 个订单`);
+      }
+    } catch (err) {
+      console.warn(`[agg] PRD_MO 订单索引失败: ${err.message}`);
+    }
+
+    this._cache.set(cacheKey, { data: map, timestamp: Date.now() });
+    return map;
+  }
+
   // ===================== 数据获取与解析 =====================
 
   /**
@@ -410,7 +518,7 @@ class AggregationEngine {
       return [];
     }
 
-    const extendedKeys = [...FIELD_KEYS, DOT_FIELD];
+    const extendedKeys = [...FIELD_KEYS, ...DOT_FIELDS];
 
     const rawResult = await this.client.executeBillQueryAll('SFC_OperationReport', {
       fieldKeys: extendedKeys,
@@ -434,9 +542,6 @@ class AggregationEngine {
 
     // 去重：基于全部字段指纹
     records = this._deduplicate(records);
-
-    // 过滤工序说明
-    records = this._filterByOperation(records);
 
     // 异常值过滤
     records = this._filterOutliers(records);
@@ -500,15 +605,191 @@ class AggregationEngine {
   _readFromStorage() {
     if (!this.db) return [];
     try {
-      const records = this.db.getAllRecords();
-      if (records.length > 0) {
-        console.log(`[agg] 从 SQLite 读取: ${records.length} 条`);
+      // 金蝶库只保留切换日之前的数据（切换日起的由 MES 库提供）
+      const records = this.db.getAllRecords().filter((r) => r.date < MES_START_DATE);
+      const mesRecords = this.mesDb
+        ? this.mesDb.getAllRecords().filter((r) => r.date >= MES_FROM_DATE)
+        : [];
+      if (records.length > 0 || mesRecords.length > 0) {
+        console.log(`[agg] 从 SQLite 读取: ${records.length} 条（金蝶）+ ${mesRecords.length} 条（MES）`);
       }
-      return records;
+      return [...records, ...mesRecords];
     } catch (err) {
       console.warn(`[agg] SQLite 读取失败: ${err.message}`);
       return [];
     }
+  }
+
+  /**
+   * 写入 MES 推送数据（按日期窗口整体替换，幂等）
+   * MES 报工可被修改/删除，窗口替换保证重复推送不会产生重复行、删掉的行也会消失。
+   * @param {Array} records - 已映射为看板记录格式
+   * @param {string} from - YYYY-MM-DD
+   * @param {string} to - YYYY-MM-DD
+   * @returns {{inserted:number, deleted:number}}
+   */
+  replaceMesRecords(records, from, to) {
+    if (!this.mesDb) throw new Error('MES 库未初始化');
+    this.mesDb.deleteRecordsInRange(from, to);
+    this.mesDb.upsertRecords(records);
+    this.mesDb.setMeta('lastPushAt', new Date().toISOString());
+    this.notifyDataChanged();
+    return { inserted: records.length };
+  }
+
+  /**
+   * 合并后的全量记录（金蝶 < 切换日 + MES >= 切换日）
+   * 生产执行看板等直接消费记录的下游，应改用此方法而不是只读金蝶库。
+   */
+  getAllRecordsMerged() {
+    return this._readFromStorage();
+  }
+
+  /** YYYY-MM-DD 前一天 */
+  _prevDay(date) {
+    return this._shiftDay(date, -1);
+  }
+
+  /** YYYY-MM-DD 后一天 */
+  _nextDay(date) {
+    return this._shiftDay(date, 1);
+  }
+
+  _shiftDay(date, delta) {
+    const d = new Date(`${date}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return date;
+    d.setDate(d.getDate() + delta);
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${d.getFullYear()}-${m}-${dd}`;
+  }
+
+  /**
+   * 聚合口径归一：把记录日期统一成「生产日期」。
+   *
+   * 记录本身按**班次日期**入库（生产执行看板要的就是这个），但总览/车间/设备
+   * 关心的是「这些产量是哪天做出来的」，晚班 20:00–次日 08:00 跨天时两者不同：
+   *   - MES 记录带 F_YJY_DAYSPLIT → 按产出明细拆成多条：产量取该日实际值，
+   *     目标 / 负荷工时 / 人工工时按产量占比分摊（保证达产率与整班一致）
+   *   - 金蝶记录没带拆分 → 日期不变（金蝶的 F_UNW_Date2 覆盖不全，不能作为基准）
+   *
+   * 只用于聚合；生产执行看板直接读记录，不走这里。
+   */
+  _toProduceDate(records) {
+    const out = [];
+    for (const r of records) {
+      const f = r.fields || {};
+      const split = String(f.F_YJY_DAYSPLIT || '').trim();
+      if (split) {
+        const parts = [];
+        for (const part of split.split(';')) {
+          const i = part.indexOf(':');
+          if (i < 0) continue;
+          const date = part.slice(0, i).trim();
+          const qty = Number(part.slice(i + 1));
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !qty) continue;
+          parts.push({ date, qty });
+        }
+        if (parts.length > 0) {
+          const total = parts.reduce((s, p) => s + p.qty, 0);
+          const num = (v) => (typeof v === 'number' ? v : Number(v) || 0);
+          const r2 = (v) => Math.round(v * 100) / 100;
+          for (const p of parts) {
+            const share = total > 0 ? p.qty / total : 1 / parts.length;
+            out.push({
+              ...r,
+              date: p.date,
+              fields: {
+                ...f,
+                FDate: p.date,
+                F_UNW_Date2: p.date,
+                FQuaQty: p.qty,
+                F_FD_AimProducts: Math.round(num(f.F_FD_AimProducts) * share),
+                F_YJY_loadTimes: r2(num(f.F_YJY_loadTimes) * share),
+                F_FD_IMPORTTIMES: r2(num(f.F_FD_IMPORTTIMES) * share),
+                F_YJY_PQWORKERTIME: r2(num(f.F_YJY_PQWORKERTIME) * share),
+                F_FD_WorkTimes: r2(num(f.F_FD_WorkTimes) * share),
+                // 已展开，清空拆分字段避免下游重复展开（会双倍计产）
+                F_YJY_DAYSPLIT: '',
+              },
+            });
+          }
+          continue;
+        }
+      }
+      out.push(r);
+    }
+    return out;
+  }
+
+  /**
+   * MES 灌装产量汇总：key = `产品名|生产日期` → 合格产量合计
+   * 供「灌装 vs 成品入库对比」页取灌装数量用（2026-09-14 起替代金蝶 PRD_INSTOCK 的 MP 入库）。
+   *
+   * 注意：记录按**班次日期**入库，本函数按**生产日期**汇总，两者会错开一天，所以
+   *   读库时下限回退一天（否则漏掉前一日晚班跨进 from 的部分），
+   *   汇总时再把结果**裁回 [from, to]**（否则 to 当天晚班跨出的次日会溢出到范围外）。
+   */
+  getMesFillSummary(from, to) {
+    const out = new Map();
+    if (!this.mesDb) return out;
+    const ranged = Boolean(from && to);
+    const inRange = (d) => !ranged || (d >= from && d <= to);
+    let rows = [];
+    try {
+      const readFrom = from ? this._prevDay(from) : from;
+      rows = readFrom && to ? this.mesDb.getRecordsInRange(readFrom, to) : this.mesDb.getAllRecords();
+    } catch (err) {
+      console.warn(`[agg] MES 灌装汇总读取失败: ${err.message}`);
+      return out;
+    }
+    for (const r of rows) {
+      const f = r.fields || {};
+      if (f.F_FD_OperDescp !== '固体灌装' && f.F_FD_OperDescp !== '液体灌装') continue;
+      const name = String(f.FMaterialName || '').trim();
+      if (!name) continue;
+
+      // 有产出日期拆分时按拆分累计（晚班跨天：一个班次的产量分属两个生产日期）
+      const split = String(f.F_YJY_DAYSPLIT || '').trim();
+      if (split) {
+        for (const part of split.split(';')) {
+          const i = part.indexOf(':');
+          if (i < 0) continue;
+          const d = part.slice(0, i).trim();
+          const q = Number(part.slice(i + 1));
+          if (!d || !q || !inRange(d)) continue;
+          const key = `${name}|${d}`;
+          out.set(key, (out.get(key) || 0) + q);
+        }
+        continue;
+      }
+
+      if (!inRange(r.date)) continue;
+      const key = `${name}|${r.date}`;
+      out.set(key, (out.get(key) || 0) + (Number(f.FQuaQty) || 0));
+    }
+    return out;
+  }
+
+  /** 最近一次 MES 推送时间（ISO 字符串；从未推送返回 null）—— 看门狗用 */
+  getMesLastPushAt() {
+    if (!this.mesDb) return null;
+    try {
+      return this.mesDb.getMeta('lastPushAt') || null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** 数据变化后清空聚合缓存，并通知外部（响应缓存等） */
+  notifyDataChanged() {
+    this._cache.clear();
+    if (this._onSync) this._onSync();
+  }
+
+  /** MES 库记录数（健康检查用） */
+  getMesRecordCount() {
+    return this.mesDb ? this.mesDb.getRecordCount() : 0;
   }
 
   /**
@@ -590,7 +871,7 @@ class AggregationEngine {
       this.db.setMeta('fmodifyDateSupported', fmdSupported ? 'true' : 'false');
     }
 
-    const extendedKeys = [...FIELD_KEYS, DOT_FIELD];
+    const extendedKeys = [...FIELD_KEYS, ...DOT_FIELDS];
     if (fmdSupported) extendedKeys.push('FModifyDate');
 
     const rawResult = await this.client.executeBillQueryAll('SFC_OperationReport', {
@@ -609,12 +890,10 @@ class AggregationEngine {
     this._applyMachineInline(rawResult, records);
     this._normalizeRecords(records);
     records = this._deduplicate(records);
-    records = this._filterByOperation(records);
     records = this._filterOutliers(records);
 
     // 解析车间名称
     await this._resolveWorkshopNames(records);
-
     // 提取 FModifyDate
     if (fmdSupported) {
       this._extractModifyDates(rawResult, records);
@@ -642,7 +921,7 @@ class AggregationEngine {
     const from = lastSync || new Date(0).toISOString();
     console.log(`[agg] 开始增量同步 since=${from}`);
 
-    const extendedKeys = [...FIELD_KEYS, DOT_FIELD, 'FModifyDate'];
+    const extendedKeys = [...FIELD_KEYS, ...DOT_FIELDS, 'FModifyDate'];
     const filter = `FDOCUMENTSTATUS = 'C' AND FModifyDate >= '${from}'`;
 
     const rawResult = await this.client.executeBillQueryAll('SFC_OperationReport', {
@@ -662,9 +941,9 @@ class AggregationEngine {
     this._applyMachineInline(rawResult, records);
     this._normalizeRecords(records);
     records = this._deduplicate(records);
-    records = this._filterByOperation(records);
     records = this._filterOutliers(records);
     await this._resolveWorkshopNames(records);
+
     this._extractModifyDates(rawResult, records);
 
     for (const r of records) {
@@ -690,8 +969,8 @@ class AggregationEngine {
       const hasHeader = rawResult[0].some(h => typeof h === 'string' && /^F[A-Z]/.test(h));
       if (hasHeader) dataStart = 1;
     }
-    // 索引：FIELD_KEYS.length (22) + DOT_FIELD (1) = 23
-    const mdIndex = FIELD_KEYS.length + 1;
+    // 索引：FIELD_KEYS.length + DOT_FIELDS.length（FModifyDate 在 dot 列之后）
+    const mdIndex = FIELD_KEYS.length + DOT_FIELDS.length;
     for (let i = 0; i < records.length; i++) {
       const row = rawResult[i + dataStart];
       if (!row) continue;
@@ -784,21 +1063,35 @@ class AggregationEngine {
       if (hasHeader) dataStart = 1;
     }
 
-    const dotColumnIndex = FIELD_KEYS.length; // 内联列在 extendedKeys 中的位置
+    const machineIndex = FIELD_KEYS.length;      // F_FD_Machine.FName
+    const operatorIndex = FIELD_KEYS.length + 1;  // F_FD_Operator.FName
 
     for (let i = 0; i < records.length; i++) {
       const row = rawResult[i + dataStart];
       if (!row) continue;
-      const machineName = row[dotColumnIndex];
+
+      // 解析设备名称
+      const machineName = row[machineIndex];
       if (machineName !== undefined && machineName !== null && machineName !== '' && machineName !== '0') {
         let name = String(machineName);
         // 模糊匹配：金蝶内联可能返回乱码多字节字符
         if (!EQUIPMENT_NAMES.has(name)) {
-          const fuzzy = EQUIPMENT_LIST.find(e => name.includes(e.name) || e.name.includes(name));
+          // 先清理乱码字符再匹配（移除 U+FFFD 替换字符）
+          const clean = name.replace(/�/g, '');
+          const fuzzy = EQUIPMENT_LIST.find(e =>
+            name.includes(e.name) || e.name.includes(name) ||
+            clean.includes(e.name) || e.name.includes(clean)
+          );
           if (fuzzy) name = fuzzy.name;
         }
         records[i].machine = name;
         records[i].fields['F_FD_Machine'] = name;
+      }
+
+      // 解析机手姓名
+      const operatorName = row[operatorIndex];
+      if (operatorName !== undefined && operatorName !== null && operatorName !== '' && operatorName !== '0') {
+        records[i].fields['F_FD_Operator'] = String(operatorName);
       }
     }
   }
@@ -859,14 +1152,17 @@ class AggregationEngine {
       const id = r.fields['F_YJY_NewRealShop'];
       const name = nameMap.get(id);
       if (name) {
-        r.workshop = name;
-        r.fields['F_YJY_NewRealShop'] = name;
+        // 金蝶部门名可能被业务改过（如去掉"号"字），归一化成主数据标准名再落库
+        const stdName = normalizeWorkshopName(name);
+        r.workshop = stdName;
+        r.fields['F_YJY_NewRealShop'] = stdName;
         replaced++;
       }
     }
 
     console.log(`[agg] 车间名称解析完成 resolved=${replaced}/${records.length}`);
   }
+
 
   /**
    * 重映射车间名称：将已合并的车间记录重命名为目标车间
@@ -937,7 +1233,10 @@ class AggregationEngine {
    * @param {string} [endDate] - 可选日期范围结束
    * @returns {object} 聚合结果
    */
-  _aggregate(records, dimension, year, startDate, endDate, powerDataMap) {
+  _aggregate(records, dimension, year, startDate, endDate, powerDataMap, orderPlanMap) {
+    // 聚合口径：总览/负载率/产品信息仍只统计 固体灌装/液体灌装
+    // （全部工序已入库，供生产执行看板读取并匹配配料&混料工时）
+    records = this._filterByOperation(records);
     if (records.length === 0) {
       return this._emptyResult(dimension, year, startDate, endDate);
     }
@@ -969,6 +1268,10 @@ class AggregationEngine {
     // 提取API响应并转换比率值为百分比（0-1 → 0-100）
     const summary = this._computeSummary(workshopPeriods, equipmentPeriods, dimension);
 
+    // 计算产品级聚合信息
+    const productInfo = this._computeProductGroups(records, dimension, year, startDate, endDate, orderPlanMap);
+    const productInfoMerged = this._computeProductGroupsMerged(records, dimension, year, startDate, endDate, orderPlanMap);
+
     return {
       dimension,
       year,
@@ -981,6 +1284,8 @@ class AggregationEngine {
       dailyWorkshopTrend,
       dailyEquipmentTrend,
       summary,
+      productInfo,
+      productInfoMerged,
     };
   }
 
@@ -1298,10 +1603,12 @@ class AggregationEngine {
       const sumDailyHours = bucket.dailyHours.reduce((a, b) => a + b, 0);
       let loadRate;
       if (type === 'workshop') {
-        // 车间负载率 = 每日负载率（电表衍生）的平均值
+        // 车间负载率 = 所有有数据天的负载率之和 / 工作日天数
+        // 分子含周末；分母 = 当月/周/年工作日数（当前周期封顶到今日）
+        // 不设 100% 上限：分子含周末时可能超过 100%，如实显示
         const dailyRates = bucket.dailyLoadRates || [];
-        loadRate = dailyRates.length > 0
-          ? Math.min(dailyRates.reduce((a, b) => a + b, 0) / dailyRates.length, 1)
+        loadRate = workingDays > 0
+          ? dailyRates.reduce((a, b) => a + b, 0) / workingDays
           : 0;
       } else {
         // 设备负载率保持原公式：总工时 / (工作天数 × 22.5h)
@@ -1463,7 +1770,311 @@ class AggregationEngine {
         avgOEE: 0,
         workshopCount: 0,
       },
+      productInfo: {
+        workshopMap: new Map(),
+        equipmentMap: new Map(),
+      },
+      productInfoMerged: {
+        workshopMap: new Map(),
+        equipmentMap: new Map(),
+        workshopEquipmentMap: new Map(),
+      },
     };
+  }
+
+  // ===================== 产品信息聚合 =====================
+
+  /**
+   * 按维度计算产品级聚合信息
+   * 每个车间/设备的记录按 (FMoNumber, F_FD_Operator, FMaterialName) 分组，
+   * 计算目标产量、实际产量、完成率等，按实际产量降序排列。
+   *
+   * @param {Array} records - 经过标准化的记录
+   * @param {string} dimension
+   * @param {number} [year]
+   * @param {string} [startDate]
+   * @param {string} [endDate]
+   * @param {Map<string,number>} orderPlanMap - FBillNo → FQty
+   * @returns {{ workshopMap: Map<string,Array>, equipmentMap: Map<string,Array> }}
+   */
+  _computeProductGroups(records, dimension, year, startDate, endDate, orderPlanMap) {
+    const workshopMap = new Map();   // key = `${ws}|${periodKey}` → Map<groupKey, group>
+    const equipmentMap = new Map();  // key = `${eq}|${periodKey}` → Map<groupKey, group>
+
+    // 预计算每个订单号的总产出（用于订单完成率分子）
+    const orderActualTotals = new Map();
+    for (const r of records) {
+      const mo = r.fields && r.fields['FMoNumber'];
+      const qty = r.fields && (typeof r.fields['FQuaQty'] === 'number' ? r.fields['FQuaQty'] : 0);
+      if (mo && qty > 0) {
+        orderActualTotals.set(mo, (orderActualTotals.get(mo) || 0) + qty);
+      }
+    }
+
+    for (const r of records) {
+      const ws = r.workshop;
+      const eq = r.machine;
+      const date = r.date;
+      if (!ws || !WORKSHOP_SET.has(ws)) continue;
+      if (!eq || !EQUIPMENT_NAMES.has(eq)) continue;
+
+      const productName = r.fields && r.fields['FMaterialName'];
+      const moNumber = r.fields && r.fields['FMoNumber'];
+      const quaQty = r.fields && (typeof r.fields['FQuaQty'] === 'number' ? r.fields['FQuaQty'] : 0);
+      const aimProducts = r.fields && (typeof r.fields['F_FD_AimProducts'] === 'number' ? r.fields['F_FD_AimProducts'] : 0);
+      const operatorName = (r.fields && r.fields['F_FD_Operator'] && r.fields['F_FD_Operator'] !== '0' && r.fields['F_FD_Operator'] !== '')
+        ? String(r.fields['F_FD_Operator']) : '——';
+
+      if (!productName || !moNumber || quaQty <= 0) continue;
+
+      const periodKey = getPeriodKey(date, dimension);
+
+      // === 车间分组 ===
+      const wsKey = `${ws}|${periodKey}`;
+      if (!workshopMap.has(wsKey)) workshopMap.set(wsKey, new Map());
+      const wsSub = workshopMap.get(wsKey);
+      const wsSubKey = `${moNumber}|${operatorName}|${productName}`;
+      if (!wsSub.has(wsSubKey)) {
+        wsSub.set(wsSubKey, {
+          productName, moNumber, operatorName,
+          targetQty: 0, actualQty: 0, machines: new Set(),
+        });
+      }
+      const wg = wsSub.get(wsSubKey);
+      wg.targetQty += aimProducts;
+      wg.actualQty += quaQty;
+      wg.machines.add(eq);
+
+      // === 设备分组 ===
+      const eqKey = `${eq}|${periodKey}`;
+      if (!equipmentMap.has(eqKey)) equipmentMap.set(eqKey, new Map());
+      const eqSub = equipmentMap.get(eqKey);
+      const eqSubKey = `${moNumber}|${operatorName}|${productName}`;
+      if (!eqSub.has(eqSubKey)) {
+        eqSub.set(eqSubKey, {
+          productName, moNumber, operatorName,
+          targetQty: 0, actualQty: 0, machines: new Set(),
+        });
+      }
+      const eg = eqSub.get(eqSubKey);
+      eg.targetQty += aimProducts;
+      eg.actualQty += quaQty;
+      eg.machines.add(eq);
+    }
+
+    // 转换为最终格式：分组 → 计算比率 → 排序
+    const _finalize = (subMap) => {
+      const groups = Array.from(subMap.values()).map(g => {
+        const dailyRate = g.targetQty > 0
+          ? +((g.actualQty / g.targetQty) * 100).toFixed(1)
+          : 0;
+        const orderActual = orderActualTotals.get(g.moNumber) || 0;
+        const orderPlan = (orderPlanMap && orderPlanMap.get(g.moNumber)) || 0;
+        const orderRate = orderPlan > 0
+          ? +((orderActual / orderPlan) * 100).toFixed(1)
+          : 0;
+        return {
+          productName: g.productName,
+          moNumber: g.moNumber,
+          operatorName: g.operatorName,
+          targetQty: Math.round(g.targetQty),
+          actualQty: Math.round(g.actualQty),
+          dailyRate,
+          orderRate,
+          machines: Array.from(g.machines).sort(),
+        };
+      });
+      groups.sort((a, b) => b.actualQty - a.actualQty);
+      return groups;
+    };
+
+    const resultWorkshop = new Map();
+    for (const [key, subMap] of workshopMap) {
+      resultWorkshop.set(key, _finalize(subMap));
+    }
+    const resultEquipment = new Map();
+    for (const [key, subMap] of equipmentMap) {
+      resultEquipment.set(key, _finalize(subMap));
+    }
+
+    return { workshopMap: resultWorkshop, equipmentMap: resultEquipment };
+  }
+
+  /**
+   * 按产品名称合并聚合（跨机手合并），每个产品分组内保留机手明细供详情页展开
+   * 分组键: (FMoNumber, FMaterialName) — 不区分机手
+   *
+   * @param {Array} records
+   * @param {string} dimension
+   * @param {number} [year]
+   * @param {string} [startDate]
+   * @param {string} [endDate]
+   * @param {Map<string,number>} orderPlanMap
+   * @returns {{ workshopMap: Map<string,Array>, equipmentMap: Map<string,Array>, workshopEquipmentMap: Map<string,Array> }}
+   *   value 格式: [{ productName, moNumber, targetQty, actualQty, dailyRate, orderRate,
+   *                  machines, operatorCount, operators: [{operatorName, targetQty, ...}] }]
+   *
+   * workshopMap: key = `${ws}|${periodKey}`（车间维度，用于总览车间卡片）
+   * equipmentMap: key = `${eq}|${periodKey}`（设备整体，跨车间合并，用于总览设备卡片/设备详情）
+   * workshopEquipmentMap: key = `${ws}|${eq}|${periodKey}`（设备+车间维度，用于车间详情，避免跨车间共用设备的产品混入）
+   */
+  _computeProductGroupsMerged(records, dimension, year, startDate, endDate, orderPlanMap) {
+    const workshopMap = new Map();   // key = `${ws}|${periodKey}` → Map<mergedKey, group>
+    const equipmentMap = new Map();
+
+    // 预计算每个订单号的总产出
+    const orderActualTotals = new Map();
+    for (const r of records) {
+      const mo = r.fields && r.fields['FMoNumber'];
+      const qty = r.fields && (typeof r.fields['FQuaQty'] === 'number' ? r.fields['FQuaQty'] : 0);
+      if (mo && qty > 0) {
+        orderActualTotals.set(mo, (orderActualTotals.get(mo) || 0) + qty);
+      }
+    }
+
+    // 第一遍：按产品+机手收集明细（用于嵌套）
+    const operatorBuckets = new Map(); // key = ws|eq|period|mo|productName → {operatorName, ...}[]
+
+    for (const r of records) {
+      const ws = r.workshop;
+      const eq = r.machine;
+      const date = r.date;
+      if (!ws || !WORKSHOP_SET.has(ws)) continue;
+      if (!eq || !EQUIPMENT_NAMES.has(eq)) continue;
+
+      const productName = r.fields && r.fields['FMaterialName'];
+      const moNumber = r.fields && r.fields['FMoNumber'];
+      const quaQty = r.fields && (typeof r.fields['FQuaQty'] === 'number' ? r.fields['FQuaQty'] : 0);
+      const aimProducts = r.fields && (typeof r.fields['F_FD_AimProducts'] === 'number' ? r.fields['F_FD_AimProducts'] : 0);
+      const operatorName = (r.fields && r.fields['F_FD_Operator'] && r.fields['F_FD_Operator'] !== '0' && r.fields['F_FD_Operator'] !== '')
+        ? String(r.fields['F_FD_Operator']) : '';
+
+      if (!productName || !moNumber || quaQty <= 0) continue;
+
+      const periodKey = getPeriodKey(date, dimension);
+
+      // 收集机手明细 key
+      const opKey = `${ws}|${eq}|${periodKey}|${moNumber}|${productName}`;
+      if (!operatorBuckets.has(opKey)) {
+        operatorBuckets.set(opKey, new Map());
+      }
+      const opSub = operatorBuckets.get(opKey);
+      const opDetailKey = operatorName || '——';
+      if (!opSub.has(opDetailKey)) {
+        opSub.set(opDetailKey, { operatorName: opDetailKey, targetQty: 0, actualQty: 0, machines: new Set() });
+      }
+      const opg = opSub.get(opDetailKey);
+      opg.targetQty += aimProducts;
+      opg.actualQty += quaQty;
+      opg.machines.add(eq);
+    }
+
+    // 第二遍：按产品合并（跨机手），并附加机手明细
+    const _mergeByProduct = (groupKeyFn) => {
+      const merged = new Map();
+      for (const [fullKey, opMap] of operatorBuckets) {
+        const parts = fullKey.split('|');
+        const ws = parts[0];
+        const eq = parts[1];
+        const periodKey = parts[2];
+        const moNumber = parts[3];
+        const productName = parts[4];
+        if (!ws || !eq || !periodKey) continue;
+
+        const mapKey = groupKeyFn(ws, eq, periodKey);
+        if (!merged.has(mapKey)) merged.set(mapKey, new Map());
+
+        const sub = merged.get(mapKey);
+        const mergedKey = `${moNumber}|${productName}`;
+        if (!sub.has(mergedKey)) {
+          sub.set(mergedKey, {
+            productName, moNumber,
+            targetQty: 0, actualQty: 0,
+            machines: new Set(),
+            operatorSet: new Set(),
+            operators: [],
+          });
+        }
+        const g = sub.get(mergedKey);
+        // 合并机手数组
+        for (const [opName, opData] of opMap) {
+          g.targetQty += opData.targetQty;
+          g.actualQty += opData.actualQty;
+          for (const m of opData.machines) g.machines.add(m);
+          g.operatorSet.add(opName);
+          // 查找是否已有此机手记录（可能跨设备）
+          let existingOp = g.operators.find(o => o.operatorName === opName);
+          if (existingOp) {
+            existingOp.targetQty += opData.targetQty;
+            existingOp.actualQty += opData.actualQty;
+            for (const m of opData.machines) existingOp.machines.add(m);
+          } else {
+            g.operators.push({
+              operatorName: opName,
+              targetQty: opData.targetQty,
+              actualQty: opData.actualQty,
+              machines: new Set(opData.machines),
+            });
+          }
+        }
+      }
+      return merged;
+    };
+
+    const wsMerged = _mergeByProduct((ws, eq, pk) => `${ws}|${pk}`);
+    const eqMerged = _mergeByProduct((ws, eq, pk) => `${eq}|${pk}`);
+    // 设备+车间维度：同一设备跨车间共用时，产品按车间分开，车间详情页用它避免混入其他车间产品
+    const wsEqMerged = _mergeByProduct((ws, eq, pk) => `${ws}|${eq}|${pk}`);
+
+    // 转换为最终格式
+    const _finalize = (subMap) => {
+      const groups = Array.from(subMap.values()).map(g => {
+        const dailyRate = g.targetQty > 0
+          ? +((g.actualQty / g.targetQty) * 100).toFixed(1)
+          : 0;
+        const orderActual = orderActualTotals.get(g.moNumber) || 0;
+        const orderPlan = (orderPlanMap && orderPlanMap.get(g.moNumber)) || 0;
+        const orderRate = orderPlan > 0
+          ? +((orderActual / orderPlan) * 100).toFixed(1)
+          : 0;
+        // 机手数组对象：计算每个机手的完成率，用普通数组替换 Set（用于 JSON 序列化）
+        const operators = g.operators.map(op => ({
+          ...op,
+          machines: Array.from(op.machines).sort(),
+          dailyRate: op.targetQty > 0 ? +((op.actualQty / op.targetQty) * 100).toFixed(1) : 0,
+        }));
+        operators.sort((a, b) => b.actualQty - a.actualQty);
+        return {
+          productName: g.productName,
+          moNumber: g.moNumber,
+          targetQty: Math.round(g.targetQty),
+          actualQty: Math.round(g.actualQty),
+          dailyRate,
+          orderRate,
+          machines: Array.from(g.machines).sort(),
+          operatorCount: g.operatorSet.size,
+          operatorNames: Array.from(g.operatorSet).filter(n => n !== '——').join('、') || '',
+          operators, // 嵌套机手明细（详情页展开用）
+        };
+      });
+      groups.sort((a, b) => b.actualQty - a.actualQty);
+      return groups;
+    };
+
+    const resultWs = new Map();
+    for (const [key, subMap] of wsMerged) {
+      resultWs.set(key, _finalize(subMap));
+    }
+    const resultEq = new Map();
+    for (const [key, subMap] of eqMerged) {
+      resultEq.set(key, _finalize(subMap));
+    }
+    const resultWsEq = new Map();
+    for (const [key, subMap] of wsEqMerged) {
+      resultWsEq.set(key, _finalize(subMap));
+    }
+
+    return { workshopMap: resultWs, equipmentMap: resultEq, workshopEquipmentMap: resultWsEq };
   }
 
   // ===================== API 响应提取 =====================
@@ -1504,6 +2115,7 @@ class AggregationEngine {
       ws.outSum += this._pct(outRate);
       ws.count++;
       ws.totalOut += period.quaQty !== undefined ? period.quaQty : (period.totalQuaQty || 0);
+      if (ws.workingDays === undefined) ws.workingDays = period.workingDays;
     }
     for (const wsName of WORKSHOPS) {
       const ws = latestWsMap.get(wsName) || { loadSum: 0, outSum: 0, count: 0, totalOut: 0 };
@@ -1513,8 +2125,11 @@ class AggregationEngine {
         area: WORKSHOP_AREAS[wsName] || null,
         outputRate: avgOutRate,
         loadRate: ws.count > 0 ? +(ws.loadSum / ws.count).toFixed(1) : 0,
+        workingDays: ws.workingDays || null,
         totalOutput: Math.round(ws.totalOut),
         status: avgOutRate >= 85 ? 'health' : avgOutRate >= 70 ? 'warning' : 'danger',
+        currentProducts: (aggregated.productInfoMerged?.workshopMap?.get(`${wsName}|${latestKey}`) || []).slice(0, 5),
+        moreProductCount: Math.max(0, (aggregated.productInfoMerged?.workshopMap?.get(`${wsName}|${latestKey}`) || []).length - 5),
       });
     }
     workshops.sort((a, b) => a.name.localeCompare(b.name));
@@ -1525,8 +2140,6 @@ class AggregationEngine {
     const trendDim = hasDateRange ? 'day' : (dimension === 'year' ? 'month' : dimension);
     const trendWsData = hasDateRange ? (aggregated.dailyWorkshopTrend || workshopPeriods)
       : (dimension === 'year' ? aggregated.monthlyWorkshopData : workshopPeriods);
-    const trendEqData = hasDateRange ? (aggregated.dailyEquipmentTrend || aggregated.equipmentPeriods)
-      : (dimension === 'year' ? aggregated.monthlyEquipmentData : aggregated.equipmentPeriods);
 
     const outputByPeriod = new Map();
     for (const [, period] of trendWsData) {
@@ -1546,32 +2159,29 @@ class AggregationEngine {
       return { label, value: Math.round(outputByPeriod.get(pk) || 0) };
     });
 
-    // 平均负载率趋势：各时段所有设备的聚合平均负载率
-    const loadRateByPeriod = new Map();
-    for (const [, period] of trendEqData) {
+    // 平均车间负载率趋势：各时段所有车间负载率的面积加权平均
+    // 与总览顶部"平均车间负载率"卡片口径一致：Σ(车间负载率×面积)/Σ面积，无数据车间计 0
+    const loadRateByPeriod = new Map(); // pk → Map<workshop, loadRate(%)>
+    for (const [, period] of trendWsData) {
       const pk = period.periodKey || period.date;
       if (!pk) continue;
-      if (!loadRateByPeriod.has(pk)) {
-        loadRateByPeriod.set(pk, { sumActualHours: 0, equipSet: new Set(), workingDays: 0 });
-      }
-      const bucket = loadRateByPeriod.get(pk);
-      const actualHours = period.dailyActualHours !== undefined ? period.dailyActualHours : (period.sumDailyHours || 0);
-      bucket.sumActualHours += actualHours;
-      const eqName = period.machine || period.groupKey;
-      if (eqName) bucket.equipSet.add(eqName);
-      if (dimension === 'day') {
-        bucket.workingDays = 1;
-      } else if (period.workingDays) {
-        bucket.workingDays = period.workingDays;
-      }
+      const ws = period.workshop;
+      if (!ws || !WORKSHOP_SET.has(ws)) continue;
+      if (!loadRateByPeriod.has(pk)) loadRateByPeriod.set(pk, new Map());
+      const loadRate = period.loadRate !== undefined ? period.loadRate : (period.dailyLoadRate || 0);
+      loadRateByPeriod.get(pk).set(ws, this._pct(loadRate));
     }
 
     const loadRateTrend = allPeriodKeys.map(pk => {
-      const bucket = loadRateByPeriod.get(pk);
-      let value = 0;
-      if (bucket && bucket.equipSet.size > 0 && bucket.workingDays > 0) {
-        value = +((bucket.sumActualHours / (bucket.equipSet.size * bucket.workingDays * DAILY_MAX_HOURS)) * 100).toFixed(1);
+      const wsRates = loadRateByPeriod.get(pk) || new Map();
+      let totalLoadWeighted = 0;
+      let totalArea = 0;
+      for (const wsName of WORKSHOPS) {
+        const area = WORKSHOP_AREAS[wsName] || 0;
+        totalLoadWeighted += (wsRates.get(wsName) || 0) * area;
+        totalArea += area;
       }
+      const value = totalArea > 0 ? +((totalLoadWeighted / totalArea)).toFixed(1) : 0;
       const label = dimension === 'year'
         ? `${parseInt(pk.slice(5, 7), 10)}月`
         : pk.length === 10 ? `${pk.slice(5, 7)}/${pk.slice(8, 10)}`
@@ -1637,6 +2247,8 @@ class AggregationEngine {
         type: eqInfo ? eqInfo.type : '未知',
         lanes: eqInfo ? eqInfo.lanes : null,
         designSpeed: eqInfo ? eqInfo.designSpeed : null,
+        currentProducts: (aggregated.productInfoMerged?.equipmentMap?.get(`${name}|${latestKey}`) || []).slice(0, 5),
+        moreProductCount: Math.max(0, (aggregated.productInfoMerged?.equipmentMap?.get(`${name}|${latestKey}`) || []).length - 5),
       });
     }
     // 按产出率降序排列，产出率为 0 的排末尾
@@ -1808,6 +2420,7 @@ class AggregationEngine {
         outputRate: outRate,
         totalOutput: Math.round(output),
         aimProd: Math.round(aimProd),
+        workingDays: period.workingDays,
       });
     }
     wsPeriods.sort((a, b) => a.periodKey.localeCompare(b.periodKey));
@@ -1857,6 +2470,19 @@ class AggregationEngine {
       avgLoadRate = latestPeriod ? latestPeriod.loadRate : 0;
     }
 
+    // 分母天数：
+    //   - 日期范围：范围内工作日总数（总览带日期进入详情的场景）
+    //   - 日维度：1（单日）
+    //   - 周/月/年：最新真实周期的工作日数；无数据为 null
+    let workingDays = null;
+    if (aggregated.startDate && aggregated.endDate) {
+      workingDays = countWorkingDays(aggregated.startDate, aggregated.endDate);
+    } else if (aggregated.dimension === 'day') {
+      workingDays = 1;
+    } else if (wsPeriods.length > 0) {
+      workingDays = wsPeriods[wsPeriods.length - 1].workingDays || null;
+    }
+
     // 从设备维度提取该车间最新时段设备列表（仅限目标年份）
     let equipLatestKey = '';
     for (const [, period] of aggregated.equipmentPeriods) {
@@ -1900,6 +2526,9 @@ class AggregationEngine {
         loadRate: +(eq.loadRateSum / eq.loadRateCount * 100).toFixed(1),
         type: eqInfo ? eqInfo.type : '未知',
         status: outRate >= 85 ? 'health' : outRate >= 70 ? 'warning' : 'danger',
+        // 设备产品按车间隔离：同一设备跨车间共用时，只取本车间的产品（避免混入其他车间产品）
+        currentProducts: aggregated.productInfoMerged?.workshopEquipmentMap?.get(`${workshopName}|${name}|${equipLatestKey}`) || [],
+        moreProductCount: Math.max(0, (aggregated.productInfoMerged?.workshopEquipmentMap?.get(`${workshopName}|${name}|${equipLatestKey}`) || []).length - 5),
       });
     }
     equipmentList.sort((a, b) => a.name.localeCompare(b.name));
@@ -1940,6 +2569,7 @@ class AggregationEngine {
       theoreticalOutput: Math.round(theoreticalOutput),
       outputRate: avgOutputRate,
       loadRate: avgLoadRate,
+      workingDays,
       equipmentList,
       outputTrend,
       loadRateTrend,
@@ -2167,6 +2797,8 @@ class AggregationEngine {
       outputTrend: filledTrends.map((p) => ({ label: trendLabel(p), value: p.totalOutput })),
       oeeTrend: filledTrends.map((p) => ({ label: trendLabel(p), value: p.oee })),
       workshopBreakdown: wsBreakdownArr,
+      currentProducts: (aggregated.productInfoMerged?.equipmentMap?.get(`${equipmentName}|${latestPk}`) || []).slice(0, 5),
+      moreProductCount: Math.max(0, (aggregated.productInfoMerged?.equipmentMap?.get(`${equipmentName}|${latestPk}`) || []).length - 5),
     };
   }
 
@@ -2234,6 +2866,15 @@ class AggregationEngine {
         monthlyEquipmentData: data.monthlyEquipmentData
           ? Array.from(data.monthlyEquipmentData.entries())
           : undefined,
+        productInfo: data.productInfo ? {
+          workshopMap: Array.from(data.productInfo.workshopMap.entries()),
+          equipmentMap: Array.from(data.productInfo.equipmentMap.entries()),
+        } : undefined,
+        productInfoMerged: data.productInfoMerged ? {
+          workshopMap: Array.from(data.productInfoMerged.workshopMap.entries()),
+          equipmentMap: Array.from(data.productInfoMerged.equipmentMap.entries()),
+          workshopEquipmentMap: Array.from(data.productInfoMerged.workshopEquipmentMap.entries()),
+        } : undefined,
       };
       const filePath = this._getCacheFilePath(dimension, year);
       fs.writeFileSync(filePath, JSON.stringify(fileData), 'utf-8');
@@ -2269,6 +2910,16 @@ class AggregationEngine {
           data.equipmentPeriods = new Map(data.equipmentPeriods || []);
           if (data.monthlyWorkshopData) data.monthlyWorkshopData = new Map(data.monthlyWorkshopData);
           if (data.monthlyEquipmentData) data.monthlyEquipmentData = new Map(data.monthlyEquipmentData);
+          // 恢复产品信息 Map
+          if (data.productInfo) {
+            data.productInfo.workshopMap = new Map(data.productInfo.workshopMap || []);
+            data.productInfo.equipmentMap = new Map(data.productInfo.equipmentMap || []);
+          }
+          if (data.productInfoMerged) {
+            data.productInfoMerged.workshopMap = new Map(data.productInfoMerged.workshopMap || []);
+            data.productInfoMerged.equipmentMap = new Map(data.productInfoMerged.equipmentMap || []);
+            data.productInfoMerged.workshopEquipmentMap = new Map(data.productInfoMerged.workshopEquipmentMap || []);
+          }
           const cacheKey = match[1]; // 如 "day_2025"
           this._cache.set(cacheKey, { data, timestamp: Date.now() });
           loaded++;

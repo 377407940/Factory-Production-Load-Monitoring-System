@@ -9,6 +9,7 @@ import EquipmentCard from '../components/widgets/EquipmentCard.vue'
 import BarChart from '../components/charts/BarChart.vue'
 import TrendLine from '../components/charts/TrendLine.vue'
 import PeriodSelector from '../components/widgets/PeriodSelector.vue'
+import { getAvailableYears } from '../utils/years'
 
 const router = useRouter()
 const route = useRoute()
@@ -22,7 +23,7 @@ const dimensions = [
 
 const currentDimension = ref(route.query.dimension || 'day')
 const currentYear = ref(parseInt(route.query.year) || new Date().getFullYear())
-const availableYears = [2025, 2026]
+const availableYears = getAvailableYears()
 const loading = ref(true)
 const overviewData = ref(null)
 const periodSelectorRef = ref(null)
@@ -312,6 +313,7 @@ watch(currentPeriod, loadData)
           :output-rate="ws.outputRate"
           :total-output="ws.totalOutput"
           :load-rate="ws.loadRate"
+          :load-rate-days="ws.workingDays"
           :status="ws.status"
           :power="ws.power"
           :power-cost="ws.powerCost"
@@ -486,13 +488,13 @@ watch(currentPeriod, loadData)
 
 .equipment-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 16px;
 }
 
 .skeleton-equipment-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 16px;
 }
 
@@ -604,6 +606,7 @@ watch(currentPeriod, loadData)
 @media (max-width: 768px) {
   .equipment-grid { grid-template-columns: 1fr; }
   .skeleton-equipment-grid { grid-template-columns: 1fr; }
+  .chart-row { grid-template-columns: 1fr; }
 }
 
 /* 同步按钮 */

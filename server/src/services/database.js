@@ -102,6 +102,23 @@ class Database {
       this.db.exec(CREATE_SQL);
       this.setMeta('schemaVersion', String(SCHEMA_VERSION));
     }
+
+    // 追加业务表：生产执行看板的手工录入笔记（幂等，不触发版本重建）
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS production_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        fdate TEXT NOT NULL,
+        mo_number TEXT NOT NULL,
+        shift TEXT DEFAULT '',
+        machine TEXT DEFAULT '',
+        operator TEXT DEFAULT '',
+        workshop TEXT DEFAULT '',
+        reason TEXT DEFAULT '',
+        recovery_plan TEXT DEFAULT '',
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(fdate, mo_number, shift, machine, operator)
+      );
+    `);
   }
 
   // ==================== 记录操作 ====================
@@ -160,6 +177,18 @@ class Database {
       console.error(`[db] 读取记录失败: ${err.message}`);
       return [];
     }
+  }
+
+  /**
+   * 删除指定日期范围内的记录（MES 推送按窗口整体替换用）
+   * @param {string} startDate - YYYY-MM-DD
+   * @param {string} endDate - YYYY-MM-DD
+   * @returns {number} 删除行数
+   */
+  deleteRecordsInRange(startDate, endDate) {
+    if (!this.db) return 0;
+    const info = this.db.prepare('DELETE FROM records WHERE fdate >= ? AND fdate <= ?').run(startDate, endDate);
+    return info.changes || 0;
   }
 
   /**
@@ -239,6 +268,83 @@ class Database {
       return row ? row.cnt : 0;
     } catch {
       return 0;
+    }
+  }
+
+  // ==================== 生产执行看板笔记 ====================
+
+  /** 读取全部手工录入的笔记（表很小，全量读） */
+  getProductionNotes() {
+    if (!this.db) return [];
+    try {
+      const rows = this.db.prepare(
+        'SELECT * FROM production_notes ORDER BY fdate ASC, mo_number ASC'
+      ).all();
+      return rows.map((r) => ({
+        id: r.id,
+        fdate: r.fdate,
+        moNumber: r.mo_number,
+        shift: r.shift,
+        machine: r.machine,
+        operator: r.operator,
+        workshop: r.workshop,
+        reason: r.reason,
+        recoveryPlan: r.recovery_plan,
+      }));
+    } catch (err) {
+      console.error(`[db] 读取生产笔记失败: ${err.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * 写入/更新一条笔记（按 日期+生产订单+班次+设备+操作人员 定位）
+   * @param {{ fdate: string, moNumber: string, shift?: string, machine?: string, operator?: string, workshop?: string, reason?: string, recoveryPlan?: string }} note
+   */
+  upsertProductionNote(note) {
+    if (!this.db || !note || !note.fdate || !note.moNumber) return;
+    try {
+      this.db.prepare(`
+        INSERT INTO production_notes (fdate, mo_number, shift, machine, operator, workshop, reason, recovery_plan, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(fdate, mo_number, shift, machine, operator) DO UPDATE SET
+          workshop = excluded.workshop,
+          reason = excluded.reason,
+          recovery_plan = excluded.recovery_plan,
+          updated_at = datetime('now')
+      `).run(
+        note.fdate,
+        note.moNumber,
+        note.shift || '',
+        note.machine || '',
+        note.operator || '',
+        note.workshop || '',
+        note.reason || '',
+        note.recoveryPlan || '',
+      );
+    } catch (err) {
+      console.error(`[db] 写入生产笔记失败: ${err.message}`);
+    }
+  }
+
+  /**
+   * 删除一条笔记（未达产原因/后续补产方案均清空时调用，按行唯一 key 定位）
+   * @param {{ fdate: string, moNumber: string, shift?: string, machine?: string, operator?: string }} note
+   */
+  deleteProductionNote(note) {
+    if (!this.db || !note || !note.fdate || !note.moNumber) return;
+    try {
+      this.db.prepare(
+        'DELETE FROM production_notes WHERE fdate = ? AND mo_number = ? AND shift = ? AND machine = ? AND operator = ?'
+      ).run(
+        note.fdate,
+        note.moNumber,
+        note.shift || '',
+        note.machine || '',
+        note.operator || '',
+      );
+    } catch (err) {
+      console.error(`[db] 删除生产笔记失败: ${err.message}`);
     }
   }
 

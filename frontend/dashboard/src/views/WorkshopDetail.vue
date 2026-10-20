@@ -7,6 +7,8 @@ import EquipmentTable from '../components/widgets/EquipmentTable.vue'
 import TrendLine from '../components/charts/TrendLine.vue'
 import BarChart from '../components/charts/BarChart.vue'
 import PeriodSelector from '../components/widgets/PeriodSelector.vue'
+import ProductTable from '../components/widgets/ProductTable.vue'
+import { getAvailableYears } from '../utils/years'
 
 const router = useRouter()
 const route = useRoute()
@@ -20,7 +22,7 @@ const dimensions = [
 
 const currentDimension = ref(route.query.dimension || 'day')
 const currentYear = ref(parseInt(route.query.year) || new Date().getFullYear())
-const availableYears = [2025, 2026]
+const availableYears = getAvailableYears()
 const loading = ref(true)
 const detailData = ref(null)
 const periodSelectorRef = ref(null)
@@ -36,6 +38,46 @@ const powerTrend = computed(() => {
 })
 
 const workshopName = computed(() => route.params.name)
+
+// 合并设备列表中的产品信息（按产品名称去重，跨设备合并产量和机手）
+function mergeProducts(equipmentList) {
+  const seen = new Map()
+  for (const eq of equipmentList) {
+    const prods = eq.currentProducts || []
+    for (const p of prods) {
+      const key = `${p.productName}|${p.moNumber}`
+      if (seen.has(key)) {
+        const existing = seen.get(key)
+        existing.targetQty += p.targetQty
+        existing.actualQty += p.actualQty
+        if (p.dailyRate > existing.dailyRate) existing.dailyRate = p.dailyRate
+        if (p.orderRate > existing.orderRate) existing.orderRate = p.orderRate
+        existing.machines = [...new Set([...existing.machines, ...p.machines])]
+        // 合并机手数组
+        if (p.operators) {
+          for (const op of p.operators) {
+            const existingOp = existing.operators.find(eo => eo.operatorName === op.operatorName)
+            if (existingOp) {
+              existingOp.targetQty += op.targetQty
+              existingOp.actualQty += op.actualQty
+              existingOp.machines = [...new Set([...existingOp.machines, ...(op.machines || [])])]
+              if (op.dailyRate > existingOp.dailyRate) existingOp.dailyRate = op.dailyRate
+            } else {
+              existing.operators.push({ ...op, machines: [...(op.machines || [])] })
+            }
+          }
+        }
+      } else {
+        seen.set(key, {
+          ...p,
+          machines: [...p.machines],
+          operators: p.operators ? p.operators.map(op => ({ ...op, machines: [...(op.machines || [])] })) : [],
+        })
+      }
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => b.actualQty - a.actualQty)
+}
 
 async function loadData() {
   loading.value = true
@@ -157,6 +199,8 @@ watch(
         :value="detailData?.loadRate ?? '--'"
         unit="%"
         color="#faad14"
+        sub-label="工作日"
+        :sub-text="detailData?.workingDays ? detailData.workingDays + ' 天' : ''"
       />
     </div>
 
@@ -191,6 +235,12 @@ watch(
         />
       </div>
     </div>
+
+    <!-- 产品信息卡片（表格） -->
+    <ProductTable
+      :products="mergeProducts(detailData?.equipmentList || [])"
+      title="当前生产产品"
+    />
 
     <!-- 设备列表 -->
     <section class="equipment-section">

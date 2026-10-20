@@ -8,6 +8,7 @@ const props = defineProps({
   totalOutput: { type: Number, default: 0 },
   outputUnit: { type: String, default: '条' },
   loadRate: { type: Number, default: 0 },
+  loadRateDays: { type: Number, default: null },
   status: { type: String, default: 'health' },
   power: { type: Number, default: null },
   powerCost: { type: Number, default: null },
@@ -34,6 +35,7 @@ const outputRateColor = computed(() => {
   if (props.outputRate >= 70) return '#F59E0B'
   return '#EF4444'
 })
+
 </script>
 
 <template>
@@ -72,6 +74,7 @@ const outputRateColor = computed(() => {
           <div class="progress-track">
             <div class="progress-fill" :style="{ width: loadRateBarWidth + '%', background: '#3B82F6' }"></div>
           </div>
+          <span v-if="loadRateDays != null" class="metric-load-days">工作日 {{ loadRateDays }} 天</span>
         </div>
         <div v-if="power !== null" class="metric-item">
           <span class="metric-label">用电量</span>
@@ -108,6 +111,7 @@ const outputRateColor = computed(() => {
 
 .workshop-body {
   flex: 1;
+  min-width: 0;
   padding: 16px 18px;
   display: flex;
   flex-direction: column;
@@ -153,6 +157,7 @@ const outputRateColor = computed(() => {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  flex-shrink: 0;
 }
 
 .metric-item {
@@ -161,6 +166,7 @@ const outputRateColor = computed(() => {
   align-items: center;
   gap: 3px;
   flex: 1;
+  min-width: 0;
 }
 
 .metric-label {
@@ -174,6 +180,10 @@ const outputRateColor = computed(() => {
   font-weight: 700;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .metric-qty {
@@ -205,6 +215,17 @@ const outputRateColor = computed(() => {
   font-weight: 600;
   color: #f97316;
   margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.metric-load-days {
+  font-size: 11px;
+  color: var(--text-muted, #94A3B8);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 @media (max-width: 768px) {
